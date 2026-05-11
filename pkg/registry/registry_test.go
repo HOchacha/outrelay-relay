@@ -41,7 +41,7 @@ func startCtrl(t *testing.T) pb.RegistryClient {
 		t.Fatal(err)
 	}
 	gs := grpc.NewServer()
-	pb.RegisterRegistryServer(gs, ctrlreg.New(st))
+	pb.RegisterRegistryServer(gs, ctrlreg.New(st, nil))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -63,7 +63,7 @@ func startCtrl(t *testing.T) pb.RegistryClient {
 func TestRegistryFacade(t *testing.T) {
 	t.Parallel()
 	ctrl := startCtrl(t)
-	r := registry.New(ctrl, "relay-1", "")
+	r := registry.New(ctrl, "relay-1", "", nil)
 
 	name, _ := identity.NewAgent("acme")
 	uri := name.String()
@@ -97,8 +97,8 @@ func TestRegistryRemoteProviderError(t *testing.T) {
 
 	// Two relays on the same controller. A registers the service;
 	// B's Resolve should yield ErrProviderRemote.
-	relayA := registry.New(ctrl, "relay-A", "us-east-1")
-	relayB := registry.New(ctrl, "relay-B", "ap-northeast-2")
+	relayA := registry.New(ctrl, "relay-A", "us-east-1", nil)
+	relayB := registry.New(ctrl, "relay-B", "ap-northeast-2", nil)
 	name, _ := identity.NewAgent("acme")
 	uri := name.String()
 	relayA.RegisterAgent(uri, &fakeProvider{uri: uri})

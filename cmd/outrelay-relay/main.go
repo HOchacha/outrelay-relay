@@ -57,6 +57,7 @@ func main() {
 		metricsDump     = flag.String("metrics-dump", "", "JSONL file path for periodic metrics dump (empty disables)")
 		metricsInterval = flag.Duration("metrics-interval", 10*time.Second, "metrics dump interval")
 		logFormat       = flag.String("log-format", "text", "log format: text or json")
+		logLevel        = flag.String("log-level", "info", "log level: debug, info, warn, error")
 		showVersion     = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -65,7 +66,7 @@ func main() {
 		return
 	}
 
-	logger := newLogger(*logFormat)
+	logger := newLogger(*logFormat, *logLevel)
 	if *certPath == "" || *keyPath == "" || *caPath == "" {
 		logger.Error("missing required flags", "cert", *certPath, "key", *keyPath, "ca", *caPath)
 		os.Exit(2)
@@ -110,7 +111,7 @@ func main() {
 	upsertCancel()
 	logger.Info("relay self-registered", "id", id, "controller", *controllerAddr, "version", Version)
 
-	reg := registry.New(ctrl, id, *region)
+	reg := registry.New(ctrl, id, *region, logger)
 
 	var (
 		policyEngine *policy.Engine
@@ -130,7 +131,7 @@ func main() {
 	// Inter-relay forwarding pool. The relay reuses its own server
 	// cert as a client cert when dialing peer relays — both sides see
 	// the URI SAN and verify against the shared CA.
-	pool := intra.NewPool(intraTLS(tlsConf))
+	pool := intra.NewPool(intraTLS(tlsConf), logger)
 	defer func() { _ = pool.Close() }()
 
 	// Observability — shared registry, optional debug HTTP and JSONL dump.
@@ -234,14 +235,28 @@ func loadServerTLS(certPath, keyPath, caPath string) (*tls.Config, error) {
 	}, nil
 }
 
-func newLogger(format string) *slog.Logger {
+func newLogger(format, level string) *slog.Logger {
+	opts := &slog.HandlerOptions{Level: parseLogLevel(level)}
 	var h slog.Handler
 	if format == "json" {
-		h = slog.NewJSONHandler(os.Stderr, nil)
+		h = slog.NewJSONHandler(os.Stderr, opts)
 	} else {
-		h = slog.NewTextHandler(os.Stderr, nil)
+		h = slog.NewTextHandler(os.Stderr, opts)
 	}
 	return slog.New(h)
+}
+
+func parseLogLevel(s string) slog.Level {
+	switch s {
+	case "debug":
+		return slog.LevelDebug
+	case "warn":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 func signalContext() (context.Context, context.CancelFunc) {

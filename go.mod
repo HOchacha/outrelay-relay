@@ -27,3 +27,10 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 	modernc.org/sqlite v1.50.0 // indirect
 )
+
+// Local sibling override: the agent / relay live next to OutRelay
+// under WIP/ and need to consume in-tree changes that haven't been
+// tagged yet. Both `go build` on the host and the Docker build
+// (which copies the OutRelay sibling alongside this module) honor
+// this replace.
+replace github.com/boanlab/OutRelay => ../OutRelay

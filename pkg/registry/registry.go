@@ -13,6 +13,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 
 	pb "github.com/boanlab/OutRelay/lib/control/v1"
@@ -44,6 +46,7 @@ type Stream interface {
 type Registry struct {
 	ctrl    pb.RegistryClient
 	relayID string
+	logger  *slog.Logger
 	// region is the relay instance's region label (--region flag).
 	// Passed through to controller.Resolve so multi-region
 	// deployments can prefer same-region providers and avoid an
@@ -57,12 +60,17 @@ type Registry struct {
 // New constructs a Registry that talks to the given controller client.
 // relayID is the relay instance's identifier (typically its URI SAN);
 // it is sent in every RegisterService / DeregisterAgent call so the
-// controller knows where each provider lives.
-func New(ctrl pb.RegistryClient, relayID, region string) *Registry {
+// controller knows where each provider lives. A nil logger disables
+// logging.
+func New(ctrl pb.RegistryClient, relayID, region string, logger *slog.Logger) *Registry {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	return &Registry{
 		ctrl:       ctrl,
 		relayID:    relayID,
 		region:     region,
+		logger:     logger,
 		agentConns: map[string]Provider{},
 	}
 }
@@ -93,13 +101,20 @@ func (r *Registry) UnregisterAgent(ctx context.Context, uri string) {
 
 	tenant := tenantOf(uri)
 	if tenant == "" {
+		r.logger.Warn("registry: deregister skipped (no tenant in uri)", "uri", uri)
 		return
 	}
-	_, _ = r.ctrl.DeregisterAgent(ctx, &pb.DeregisterAgentRequest{
+	if _, err := r.ctrl.DeregisterAgent(ctx, &pb.DeregisterAgentRequest{
 		Tenant:   tenant,
 		AgentUri: uri,
 		RelayId:  r.relayID,
-	})
+	}); err != nil {
+		r.logger.Warn("registry: controller deregister failed",
+			"tenant", tenant, "uri", uri, "relay", r.relayID, "err", err)
+		return
+	}
+	r.logger.Debug("registry: agent deregistered at controller",
+		"tenant", tenant, "uri", uri)
 }
 
 // RegisterService publishes a service registration to the controller.

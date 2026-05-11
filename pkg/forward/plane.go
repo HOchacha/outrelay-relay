@@ -135,12 +135,16 @@ func (p *Plane) Run(ctx context.Context) error {
 			return fmt.Errorf("forward: read: %w", err)
 		}
 		if n < 4 {
+			p.logger.Debug("forward: dropping short packet",
+				"src", srcAP.String(), "len", n)
 			continue
 		}
 		peerAlloc := binary.BigEndian.Uint32(buf[:4])
 		if peerAlloc == 0 {
 			// Registration: trailing payload is [my_alloc: u32 BE].
 			if n < 8 {
+				p.logger.Warn("forward: invalid registration packet",
+					"src", srcAP.String(), "len", n)
 				continue
 			}
 			myAlloc := binary.BigEndian.Uint32(buf[4:8])
@@ -152,6 +156,8 @@ func (p *Plane) Run(ctx context.Context) error {
 		dst, ok := p.allocs[peerAlloc]
 		p.mu.RUnlock()
 		if !ok {
+			p.logger.Debug("forward: drop (alloc not registered)",
+				"alloc_id", peerAlloc, "src", srcAP.String())
 			continue
 		}
 		_, _ = p.udp.WriteToUDPAddrPort(buf[4:n], dst)

@@ -153,13 +153,13 @@ func startRelay(t *testing.T, ca *pki.CA, cert *tls.Certificate, ctrl pb.Registr
 		t.Fatal(err)
 	}
 
-	reg := registry.New(ctrl, relayID, "")
+	reg := registry.New(ctrl, relayID, "", nil)
 	pool := intra.NewPool(&tls.Config{
 		Certificates: []tls.Certificate{*cert},
 		RootCAs:      ca.CertPool(),
 		ServerName:   "localhost",
 		MinVersion:   tls.VersionTLS13,
-	})
+	}, nil)
 	srv := edge.New(ln.Addr().String(), nil, reg, nil, nil, nil, pool, nil, nil, slog.New(slog.DiscardHandler))
 	ctx, cancel := context.WithCancel(t.Context())
 	go func() { _ = srv.RunListener(ctx, ln) }()
@@ -200,7 +200,7 @@ func startCtrl(t *testing.T) pb.RegistryClient {
 		t.Fatal(err)
 	}
 	gs := grpc.NewServer()
-	pb.RegisterRegistryServer(gs, ctrlreg.New(st))
+	pb.RegisterRegistryServer(gs, ctrlreg.New(st, nil))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

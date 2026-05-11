@@ -77,7 +77,7 @@ func TestE2EConsumerProviderSplice(t *testing.T) {
 
 	// Spin up a controller in-process so the relay can publish/resolve.
 	ctrl := startInProcessController(t)
-	reg := registry.New(ctrl, "relay-test", "")
+	reg := registry.New(ctrl, "relay-test", "", nil)
 
 	srv := edge.New(ln.Addr().String(), nil, reg, nil, nil, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	relayCtx, cancelRelay := context.WithCancel(t.Context())
@@ -316,7 +316,7 @@ func startInProcessController(t *testing.T) pb.RegistryClient {
 		t.Fatal(err)
 	}
 	gs := grpc.NewServer()
-	pb.RegisterRegistryServer(gs, ctrlreg.New(st))
+	pb.RegisterRegistryServer(gs, ctrlreg.New(st, nil))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

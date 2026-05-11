@@ -73,9 +73,9 @@ test: ## go test -race -count=1 ./...
 # === Container image ==================================================
 
 build-image: ## docker build -> $(IMAGE):$(TAG) and $(IMAGE):latest
-	$(DOCKER) build -f Dockerfile \
+	$(DOCKER) build -f $(CURDIR)/Dockerfile \
 	  -t $(IMAGE):$(TAG) -t $(IMAGE):latest \
-	  --build-arg VERSION=$(TAG) .
+	  --build-arg VERSION=$(TAG) $(CURDIR)/..
 
 push-image: build-image ## docker push both $(TAG) and latest
 	$(DOCKER) push $(IMAGE):$(TAG)

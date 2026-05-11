@@ -14,6 +14,8 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"sync"
 
 	"github.com/boanlab/OutRelay/lib/orp"
@@ -28,6 +30,7 @@ import (
 // is fine for the small relay fan-out and avoids stale state.
 type Pool struct {
 	tlsConf *tls.Config
+	logger  *slog.Logger
 
 	mu    sync.Mutex
 	conns map[string]transport.Conn // relay-id -> conn
@@ -35,10 +38,15 @@ type Pool struct {
 
 // NewPool constructs an empty pool. tlsConf is used for outbound mTLS
 // to peer relays — typically the same client cert/CA as the local
-// relay's listener, with the relay's URI SAN.
-func NewPool(tlsConf *tls.Config) *Pool {
+// relay's listener, with the relay's URI SAN. A nil logger disables
+// logging.
+func NewPool(tlsConf *tls.Config, logger *slog.Logger) *Pool {
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	return &Pool{
 		tlsConf: tlsConf,
+		logger:  logger,
 		conns:   map[string]transport.Conn{},
 	}
 }
@@ -49,13 +57,18 @@ func (p *Pool) Get(ctx context.Context, relayID, endpoint string) (transport.Con
 	p.mu.Lock()
 	if c, ok := p.conns[relayID]; ok {
 		p.mu.Unlock()
+		p.logger.Debug("intra: pool hit", "relay_id", relayID)
 		return c, nil
 	}
 	p.mu.Unlock()
 
 	// Dial outside the lock so we don't block other relay-id lookups.
+	p.logger.Debug("intra: dialing peer relay",
+		"relay_id", relayID, "endpoint", endpoint)
 	c, err := transport.DialQUIC(ctx, endpoint, p.tlsConf, nil)
 	if err != nil {
+		p.logger.Warn("intra: dial peer failed",
+			"relay_id", relayID, "endpoint", endpoint, "err", err)
 		return nil, fmt.Errorf("intra: dial peer %s at %s: %w", relayID, endpoint, err)
 	}
 
@@ -63,10 +76,14 @@ func (p *Pool) Get(ctx context.Context, relayID, endpoint string) (transport.Con
 	defer p.mu.Unlock()
 	if existing, ok := p.conns[relayID]; ok {
 		// Race: another caller dialed first. Close ours.
+		p.logger.Debug("intra: dial race; reusing existing",
+			"relay_id", relayID)
 		_ = c.Close()
 		return existing, nil
 	}
 	p.conns[relayID] = c
+	p.logger.Info("intra: peer relay connected",
+		"relay_id", relayID, "endpoint", endpoint)
 	return c, nil
 }
 
@@ -78,6 +95,7 @@ func (p *Pool) Drop(relayID string) {
 	delete(p.conns, relayID)
 	p.mu.Unlock()
 	if ok {
+		p.logger.Info("intra: dropping peer conn", "relay_id", relayID)
 		_ = c.Close()
 	}
 }

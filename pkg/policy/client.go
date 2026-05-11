@@ -47,8 +47,10 @@ func (w *Watcher) Run(ctx context.Context) error {
 }
 
 func (w *Watcher) runOnce(ctx context.Context) error {
+	w.logger.Debug("policy: opening watch stream", "tenant", w.tenant)
 	stream, err := w.client.Watch(ctx, &pb.WatchPoliciesRequest{Tenant: w.tenant})
 	if err != nil {
+		w.logger.Warn("policy: watch open failed", "tenant", w.tenant, "err", err)
 		return err
 	}
 	// Accumulate the initial snapshot, then bulk-Set so we don't flap
@@ -58,6 +60,7 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 	for {
 		ev, err := stream.Recv()
 		if err == io.EOF {
+			w.logger.Info("policy: watch stream closed (EOF)", "tenant", w.tenant)
 			return nil
 		}
 		if err != nil {
@@ -71,6 +74,8 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 			if inSnapshot {
 				pending = append(pending, FromPB(ev.Rule))
 			} else {
+				w.logger.Debug("policy: rule added (live)",
+					"tenant", w.tenant, "rule_id", ev.Rule.Id)
 				w.engine.Add(FromPB(ev.Rule))
 				w.cache.Flush()
 			}
@@ -78,9 +83,13 @@ func (w *Watcher) runOnce(ctx context.Context) error {
 			if ev.RemovedId == "" {
 				continue
 			}
+			w.logger.Debug("policy: rule removed (live)",
+				"tenant", w.tenant, "rule_id", ev.RemovedId)
 			w.engine.Remove(ev.RemovedId)
 			w.cache.Flush()
 		case pb.PolicyEvent_POLICY_KIND_SNAPSHOT_END:
+			w.logger.Info("policy: snapshot applied",
+				"tenant", w.tenant, "rule_count", len(pending))
 			w.engine.Set(pending)
 			w.cache.Flush()
 			pending = nil

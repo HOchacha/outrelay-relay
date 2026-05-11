@@ -53,7 +53,7 @@ func TestCheckpointForwardRoundTrip(t *testing.T) {
 	}
 	defer ln.Close()
 
-	reg := registry.New(ctrlClient, "relay-r", "")
+	reg := registry.New(ctrlClient, "relay-r", "", nil)
 	srv := edge.New(ln.Addr().String(), nil, reg, nil, nil, nil, nil, nil, nil, slog.New(slog.DiscardHandler))
 	srvCtx, srvCancel := context.WithCancel(t.Context())
 	defer srvCancel()
