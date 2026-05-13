@@ -407,6 +407,10 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		}
 		p2pMode = dec.P2PMode
 		relayMode = dec.RelayMode
+		s.logger.Debug("edge: policy evaluated (caller-side)",
+			"caller", caller.uri, "target", open.TargetService, "method", open.Method,
+			"decision", dec.Decision.String(), "relay_mode", relayMode.String(),
+			"p2p_mode", p2pMode.String(), "reason", dec.Reason)
 	}
 
 	prov, remote, err := s.reg.Resolve(ctx, caller.uri, open.TargetService)
@@ -523,6 +527,8 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	if relayMode == policy.RelayModeForward && s.forward != nil {
 		provAC, _ := s.reg.LookupAgent(prov.AgentURI()).(*AgentConn)
 		if provAC == nil {
+			s.logger.Warn("edge: forward — provider control channel unavailable",
+				"caller", caller.uri, "provider", prov.AgentURI(), "stream_id", open.StreamId)
 			_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
 				Code: 502, Reason: "forward: provider control channel unavailable",
 			})
@@ -534,12 +540,18 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		defer s.forward.Forget(providerAlloc)
 
 		fwdEndpoint := s.forward.Endpoint().String()
+		s.logger.Info("edge: forward — allocations granted",
+			"stream_id", open.StreamId, "caller", caller.uri, "provider", prov.AgentURI(),
+			"consumer_alloc", consumerAlloc, "provider_alloc", providerAlloc,
+			"endpoint", fwdEndpoint)
 		if err := caller.WriteCtrl(orp.FrameTypeAllocGranted, &orpv1.AllocGranted{
 			StreamId:        open.StreamId,
 			MyAllocation:    consumerAlloc,
 			PeerAllocation:  providerAlloc,
 			ForwardEndpoint: fwdEndpoint,
 		}); err != nil {
+			s.logger.Warn("edge: AllocGranted write to consumer failed",
+				"stream_id", open.StreamId, "caller", caller.uri, "err", err)
 			return
 		}
 		if err := provAC.WriteCtrl(orp.FrameTypeAllocGranted, &orpv1.AllocGranted{
@@ -548,6 +560,8 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 			PeerAllocation:  consumerAlloc,
 			ForwardEndpoint: fwdEndpoint,
 		}); err != nil {
+			s.logger.Warn("edge: AllocGranted write to provider failed",
+				"stream_id", open.StreamId, "provider", prov.AgentURI(), "err", err)
 			return
 		}
 		// Park: drain both data streams so we exit (and free
@@ -558,6 +572,8 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		go func() { _, _ = io.Copy(io.Discard, consumerStream); done <- struct{}{} }()
 		go func() { _, _ = io.Copy(io.Discard, provStream); done <- struct{}{} }()
 		<-done
+		s.logger.Info("edge: forward — stream torn down, releasing allocations",
+			"stream_id", open.StreamId, "consumer_alloc", consumerAlloc, "provider_alloc", providerAlloc)
 		return
 	}
 
