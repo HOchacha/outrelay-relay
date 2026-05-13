@@ -172,6 +172,8 @@ func main() {
 				logger.Warn("listen-forward loop exited", "err", err)
 			}
 		}()
+	} else {
+		logger.Warn("forward plane disabled (--listen-forward empty) — relay_mode=forward policies will silently downgrade to splice on this relay")
 	}
 
 	srv := edge.New(*listen, tlsConf, reg, policyEngine, policyCache, auditEm, pool, forwardPlane, obsReg, logger)

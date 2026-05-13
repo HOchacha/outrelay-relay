@@ -437,6 +437,10 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	if s.policy != nil {
 		callee := s.evaluate(prov.AgentURI(), caller.uri, open.Method)
 		s.recordAudit(prov.AgentURI(), caller.uri, open.Method, callee)
+		s.logger.Debug("edge: policy evaluated (callee-side)",
+			"provider", prov.AgentURI(), "caller", caller.uri, "method", open.Method,
+			"decision", callee.Decision.String(), "relay_mode", callee.RelayMode.String(),
+			"p2p_mode", callee.P2PMode.String(), "reason", callee.Reason)
 		if callee.Decision == policy.DecisionDeny {
 			_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
 				Code: 403, Reason: "denied (callee): " + callee.Reason,
@@ -444,7 +448,28 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 			return
 		}
 		p2pMode = policy.CombineP2PModes(p2pMode, callee.P2PMode)
+		// Note: callee.RelayMode is intentionally NOT combined here —
+		// caller-side relay_mode wins. The Debug log above makes that
+		// visible if the two sides disagree.
 	}
+
+	// Final mode decision for this stream — logged once at Info so
+	// production logs always show splice vs forward without --log-level=debug.
+	// Also surfaces the silent-downgrade case (policy says forward but the
+	// relay has no forward plane configured, so the data path falls back
+	// to splice).
+	effectiveRelayMode := relayMode
+	if relayMode == policy.RelayModeForward && s.forward == nil {
+		s.logger.Warn("edge: policy requests forward but forward plane is disabled — falling back to splice (start relay with --listen-forward)",
+			"stream_id", open.StreamId, "caller", caller.uri, "provider", prov.AgentURI())
+		effectiveRelayMode = policy.RelayModeSplice
+	}
+	s.logger.Info("edge: stream mode resolved",
+		"stream_id", open.StreamId, "caller", caller.uri, "provider", prov.AgentURI(),
+		"service", open.TargetService,
+		"policy_relay_mode", relayMode.String(),
+		"effective_relay_mode", effectiveRelayMode.String(),
+		"p2p_mode", p2pMode.String())
 
 	s.logger.Debug("edge: OpenIncoming begin",
 		"stream_id", open.StreamId, "consumer", caller.uri,
