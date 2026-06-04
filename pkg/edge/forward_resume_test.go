@@ -8,10 +8,17 @@ package edge
 // because forwardMatcher mirrors resumeMatcher's contract.
 
 import (
+	"context"
+	"log/slog"
+	"net"
 	"testing"
 	"time"
 
+	"github.com/boanlab/OutRelay/lib/orp"
+	orpv1 "github.com/boanlab/OutRelay/lib/orp/v1"
 	"github.com/boanlab/OutRelay/lib/resume"
+
+	"github.com/boanlab/outrelay-relay/pkg/forward"
 )
 
 func TestForwardMatcherPairsBothHalves(t *testing.T) {
@@ -122,5 +129,110 @@ func waitMatchForward(t *testing.T, ch <-chan *halfForwardResume, d time.Duratio
 	case <-time.After(d):
 		t.Fatal("match channel did not fire")
 		return nil
+	}
+}
+
+// fakeCtrlStream wraps a net.Conn so it satisfies transport.Stream.
+// Used to mock AgentConn.ctrl in handleForwardResume tests so we can
+// verify the AllocGranted bytes the handler writes back without
+// spinning up real QUIC.
+type fakeCtrlStream struct {
+	net.Conn
+}
+
+func (s *fakeCtrlStream) StreamID() uint64  { return 0 }
+func (s *fakeCtrlStream) CancelRead(uint64) {}
+
+// TestHandleForwardResumePairsAndGrantsBoth — end-to-end through the
+// edge.Server orchestration: two agents submit FORWARD_RESUME for the
+// same stream id, handleForwardResume drives the matcher pair off the
+// goroutine path, allocates two fresh plane ids, and writes an
+// AllocGranted to each AgentConn's ctrl stream with the alloc ids
+// swapped for each side. Locks in the wire shape Stage 6+7+8 on the
+// agent depend on.
+func TestHandleForwardResumePairsAndGrantsBoth(t *testing.T) {
+	t.Parallel()
+
+	plane, err := forward.NewPlane("127.0.0.1:0", slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewPlane: %v", err)
+	}
+	defer func() { _ = plane.Close() }()
+	planeCtx, planeCancel := context.WithCancel(t.Context())
+	defer planeCancel()
+	go func() { _ = plane.Run(planeCtx) }()
+
+	srv := New("", nil, nil, nil, nil, nil, nil, plane, nil, slog.New(slog.DiscardHandler))
+
+	// Build two AgentConn pairs, each with a pipe-backed ctrl stream
+	// so the test side can read whatever WriteCtrl emits.
+	mkPair := func(uri string) (*AgentConn, net.Conn) {
+		serverEnd, testEnd := net.Pipe()
+		ac := &AgentConn{uri: uri, ctrl: &fakeCtrlStream{Conn: serverEnd}}
+		return ac, testEnd
+	}
+	aAC, aRead := mkPair("outrelay://acme/agent/aaa")
+	bAC, bRead := mkPair("outrelay://acme/agent/bbb")
+	defer func() { _ = aRead.Close() }()
+	defer func() { _ = bRead.Close() }()
+
+	streamID := uint64(0xcafef00d)
+	frame := func(stream uint64, myPos, peerAck uint64) *orp.Frame {
+		f, ferr := orp.MarshalProto(orp.FrameTypeForwardResume, &orpv1.ForwardResume{
+			StreamId:        stream,
+			MyPosition:      myPos,
+			PeerAckPosition: peerAck,
+		})
+		if ferr != nil {
+			t.Fatalf("marshal: %v", ferr)
+		}
+		return f
+	}
+
+	srv.handleForwardResume(aAC, frame(streamID, 16768, 16768))
+	srv.handleForwardResume(bAC, frame(streamID, 16768, 16768))
+
+	// Each side should observe an AllocGranted with the same stream id.
+	readGranted := func(t *testing.T, r net.Conn) *orpv1.AllocGranted {
+		t.Helper()
+		_ = r.SetReadDeadline(time.Now().Add(2 * time.Second))
+		f, ferr := orp.ParseFrame(r)
+		if ferr != nil {
+			t.Fatalf("ParseFrame: %v", ferr)
+		}
+		if f.Type != orp.FrameTypeAllocGranted {
+			t.Fatalf("frame type: got %v want AllocGranted", f.Type)
+		}
+		g := &orpv1.AllocGranted{}
+		if uerr := orp.UnmarshalProto(f, orp.FrameTypeAllocGranted, g); uerr != nil {
+			t.Fatalf("unmarshal: %v", uerr)
+		}
+		return g
+	}
+
+	aGranted := readGranted(t, aRead)
+	bGranted := readGranted(t, bRead)
+
+	if aGranted.StreamId != streamID || bGranted.StreamId != streamID {
+		t.Fatalf("stream_id mismatch: a=%d b=%d want=%d",
+			aGranted.StreamId, bGranted.StreamId, streamID)
+	}
+	if aGranted.MyAllocation == 0 || bGranted.MyAllocation == 0 {
+		t.Fatalf("alloc 0 not allowed: a=%d b=%d",
+			aGranted.MyAllocation, bGranted.MyAllocation)
+	}
+	if aGranted.MyAllocation == bGranted.MyAllocation {
+		t.Fatalf("both sides got same MyAllocation %d", aGranted.MyAllocation)
+	}
+	// Each side's "my" is the other side's "peer".
+	if aGranted.MyAllocation != bGranted.PeerAllocation {
+		t.Fatalf("a.my=%d != b.peer=%d", aGranted.MyAllocation, bGranted.PeerAllocation)
+	}
+	if bGranted.MyAllocation != aGranted.PeerAllocation {
+		t.Fatalf("b.my=%d != a.peer=%d", bGranted.MyAllocation, aGranted.PeerAllocation)
+	}
+	if aGranted.ForwardEndpoint == "" || bGranted.ForwardEndpoint == "" {
+		t.Fatalf("forward endpoint empty: a=%q b=%q",
+			aGranted.ForwardEndpoint, bGranted.ForwardEndpoint)
 	}
 }
