@@ -64,6 +64,12 @@ type Server struct {
 	// MIGRATE_TO_P2P, kept around for MigrationTTL so a fast
 	// MIGRATE_TO_RELAY demotion can pick up the same metadata.
 	migrated *migratedLRU
+
+	// forwardResumer pairs FORWARD_RESUME halves from two reconnecting
+	// agents by stream id, then the matched pair receives a fresh
+	// allocation grant. Phase 2 of forward-mode recovery — see
+	// hocha-work/forward-resume-flow.md.
+	forwardResumer *forwardMatcher
 }
 
 type streamPair struct {
@@ -74,18 +80,21 @@ type streamPair struct {
 // relayMetrics holds the named instances we touch on the hot path.
 // Pulled into a struct so each lookup happens once at construction.
 type relayMetrics struct {
-	streamOpenDuration    *observe.Histogram
-	streamActive          *observe.Gauge
-	policyEvalDuration    *observe.Histogram
-	policyCacheHits       *observe.Counter
-	policyCacheMisses     *observe.Counter
-	bytesForwarded        *observe.Counter
-	intraRelayHops        *observe.Counter
-	streamRejects         *observe.Counter
-	streamOpens           *observe.Counter
-	streamMigratedP2P     *observe.Counter
-	streamMigratedRelay   *observe.Counter
-	streamForwardAssigned *observe.Counter
+	streamOpenDuration           *observe.Histogram
+	streamActive                 *observe.Gauge
+	policyEvalDuration           *observe.Histogram
+	policyCacheHits              *observe.Counter
+	policyCacheMisses            *observe.Counter
+	bytesForwarded               *observe.Counter
+	intraRelayHops               *observe.Counter
+	streamRejects                *observe.Counter
+	streamOpens                  *observe.Counter
+	streamMigratedP2P            *observe.Counter
+	streamMigratedRelay          *observe.Counter
+	streamForwardAssigned        *observe.Counter
+	streamForwardResumeSubmitted *observe.Counter
+	streamForwardResumePaired    *observe.Counter
+	streamForwardResumeTimeout   *observe.Counter
 }
 
 func newRelayMetrics(reg *observe.Registry) *relayMetrics {
@@ -93,18 +102,21 @@ func newRelayMetrics(reg *observe.Registry) *relayMetrics {
 		return nil
 	}
 	return &relayMetrics{
-		streamOpenDuration:    reg.Histogram("stream_open_duration"),
-		streamActive:          reg.Gauge("stream_active"),
-		policyEvalDuration:    reg.Histogram("policy_eval_duration"),
-		policyCacheHits:       reg.Counter("policy_cache_hits"),
-		policyCacheMisses:     reg.Counter("policy_cache_misses"),
-		bytesForwarded:        reg.Counter("bytes_forwarded"),
-		intraRelayHops:        reg.Counter("intra_relay_hops"),
-		streamRejects:         reg.Counter("stream_rejects"),
-		streamOpens:           reg.Counter("stream_opens_total"),
-		streamMigratedP2P:     reg.Counter("stream_migrated_p2p_total"),
-		streamMigratedRelay:   reg.Counter("stream_migrated_relay_total"),
-		streamForwardAssigned: reg.Counter("stream_forward_assigned_total"),
+		streamOpenDuration:           reg.Histogram("stream_open_duration"),
+		streamActive:                 reg.Gauge("stream_active"),
+		policyEvalDuration:           reg.Histogram("policy_eval_duration"),
+		policyCacheHits:              reg.Counter("policy_cache_hits"),
+		policyCacheMisses:            reg.Counter("policy_cache_misses"),
+		bytesForwarded:               reg.Counter("bytes_forwarded"),
+		intraRelayHops:               reg.Counter("intra_relay_hops"),
+		streamRejects:                reg.Counter("stream_rejects"),
+		streamOpens:                  reg.Counter("stream_opens_total"),
+		streamMigratedP2P:            reg.Counter("stream_migrated_p2p_total"),
+		streamMigratedRelay:          reg.Counter("stream_migrated_relay_total"),
+		streamForwardAssigned:        reg.Counter("stream_forward_assigned_total"),
+		streamForwardResumeSubmitted: reg.Counter("stream_forward_resume_submitted_total"),
+		streamForwardResumePaired:    reg.Counter("stream_forward_resume_paired_total"),
+		streamForwardResumeTimeout:   reg.Counter("stream_forward_resume_timeout_total"),
 	}
 }
 
@@ -116,19 +128,20 @@ func New(listenAddr string, tlsConf *tls.Config, reg *registry.Registry, policyE
 		logger = slog.Default()
 	}
 	return &Server{
-		listenAddr: listenAddr,
-		tlsConf:    tlsConf,
-		reg:        reg,
-		policy:     policyEngine,
-		cache:      cache,
-		audit:      auditEm,
-		pool:       pool,
-		forward:    fwd,
-		metrics:    newRelayMetrics(obsReg),
-		resumer:    newResumeMatcher(),
-		pairs:      map[uint64]streamPair{},
-		migrated:   newMigratedLRU(),
-		logger:     logger,
+		listenAddr:     listenAddr,
+		tlsConf:        tlsConf,
+		reg:            reg,
+		policy:         policyEngine,
+		cache:          cache,
+		audit:          auditEm,
+		pool:           pool,
+		forward:        fwd,
+		metrics:        newRelayMetrics(obsReg),
+		resumer:        newResumeMatcher(),
+		pairs:          map[uint64]streamPair{},
+		migrated:       newMigratedLRU(),
+		forwardResumer: newForwardMatcher(),
+		logger:         logger,
 	}
 }
 
@@ -338,6 +351,8 @@ func (s *Server) controlLoop(ctx context.Context, ac *AgentConn, ctrl transport.
 			s.forwardCheckpoint(ac, f)
 		case orp.FrameTypeMigrateToP2P:
 			s.handleMigrateToP2P(ac, f)
+		case orp.FrameTypeForwardResume:
+			s.handleForwardResume(ac, f)
 		default:
 			s.logger.Warn("unexpected control frame", "type", f.Type, "from", ac.uri)
 		}
@@ -1023,6 +1038,97 @@ func (s *Server) handleMigrateToP2P(ac *AgentConn, f *orp.Frame) {
 		s.metrics.streamMigratedP2P.Inc()
 	}
 	s.logger.Info("stream migrated to p2p", "stream_id", m.StreamId, "by", ac.uri)
+}
+
+// handleForwardResume pairs FORWARD_RESUME halves from two
+// reconnecting agents and, on pair, allocates a fresh pair of forward
+// plane ids and writes AllocGranted (with the same stream_id) back
+// to each AgentConn. Both agents then rebuild forward.Conn + e2e
+// QUIC + stream via ResumableForwardStream.PrepareResume.
+//
+// The forward plane being nil (the relay was started without
+// --listen-forward) is a config mismatch — the agent should not have
+// been in forward mode in the first place. Log and drop.
+//
+// Phase 2 of forward-mode recovery; see hocha-work/forward-resume-flow.md.
+func (s *Server) handleForwardResume(ac *AgentConn, f *orp.Frame) {
+	m := &orpv1.ForwardResume{}
+	if err := orp.UnmarshalProto(f, orp.FrameTypeForwardResume, m); err != nil {
+		s.logger.Warn("edge: FORWARD_RESUME unmarshal failed",
+			"from", ac.uri, "err", err)
+		return
+	}
+	if s.forward == nil {
+		s.logger.Warn("edge: FORWARD_RESUME received but forward plane disabled",
+			"from", ac.uri, "stream_id", m.StreamId)
+		return
+	}
+	if s.metrics != nil {
+		s.metrics.streamForwardResumeSubmitted.Inc()
+	}
+	s.logger.Debug("edge: FORWARD_RESUME received",
+		"from", ac.uri, "stream_id", m.StreamId,
+		"my_pos", m.MyPosition, "peer_ack_pos", m.PeerAckPosition)
+
+	self := &halfForwardResume{
+		id:         resume.StreamID(m.StreamId),
+		agentURI:   ac.uri,
+		ac:         ac,
+		myPos:      m.MyPosition,
+		peerAckPos: m.PeerAckPosition,
+	}
+	go s.driveForwardResume(self)
+}
+
+// driveForwardResume submits self to the forwardMatcher and, when the
+// peer arrives, issues fresh allocations + AllocGranted to both. Runs
+// in its own goroutine so the controlLoop is never blocked on the
+// match window. Timeout is observable through the
+// stream_forward_resume_timeout_total counter.
+func (s *Server) driveForwardResume(self *halfForwardResume) {
+	peer, ok := <-s.forwardResumer.Submit(self)
+	if !ok || peer == nil {
+		if s.metrics != nil {
+			s.metrics.streamForwardResumeTimeout.Inc()
+		}
+		s.logger.Warn("edge: FORWARD_RESUME match window expired",
+			"stream_id", uint64(self.id), "from", self.agentURI)
+		return
+	}
+	if s.metrics != nil {
+		s.metrics.streamForwardResumePaired.Inc()
+	}
+
+	selfAlloc := s.forward.Allocate()
+	peerAlloc := s.forward.Allocate()
+	fwdEndpoint := s.forward.Endpoint().String()
+	streamID := uint64(self.id)
+
+	s.logger.Info("edge: FORWARD_RESUME paired, re-issuing allocations",
+		"stream_id", streamID,
+		"self_uri", self.agentURI, "self_alloc", selfAlloc,
+		"peer_uri", peer.agentURI, "peer_alloc", peerAlloc)
+
+	if err := self.ac.WriteCtrl(orp.FrameTypeAllocGranted, &orpv1.AllocGranted{
+		StreamId:        streamID,
+		MyAllocation:    selfAlloc,
+		PeerAllocation:  peerAlloc,
+		ForwardEndpoint: fwdEndpoint,
+	}); err != nil {
+		s.logger.Warn("edge: FORWARD_RESUME write to self failed",
+			"stream_id", streamID, "uri", self.agentURI, "err", err)
+		// Best-effort still write to peer; the resume on one side will
+		// time out on its own but we shouldn't block the other.
+	}
+	if err := peer.ac.WriteCtrl(orp.FrameTypeAllocGranted, &orpv1.AllocGranted{
+		StreamId:        streamID,
+		MyAllocation:    peerAlloc,
+		PeerAllocation:  selfAlloc,
+		ForwardEndpoint: fwdEndpoint,
+	}); err != nil {
+		s.logger.Warn("edge: FORWARD_RESUME write to peer failed",
+			"stream_id", streamID, "uri", peer.agentURI, "err", err)
+	}
 }
 
 // handleMigrateToRelay re-uses the resumeMatcher to re-pair the two
