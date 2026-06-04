@@ -45,6 +45,12 @@ type halfForwardResume struct {
 
 	arrivedAt time.Time
 	matched   chan *halfForwardResume
+
+	// timedOut is set by the expiry goroutine when the matching
+	// window elapses without a peer. The handler reads it after
+	// receiving (nil, false) on matched to distinguish "we were the
+	// first arrival, peer drove the pair" from "no peer ever came."
+	timedOut bool
 }
 
 // forwardMatcher pairs FORWARD_RESUME halves from two reconnecting
@@ -64,11 +70,16 @@ func newForwardMatcher() *forwardMatcher {
 	return &forwardMatcher{pending: map[resume.StreamID]*halfForwardResume{}}
 }
 
-// Submit registers half. If a peer half is already waiting, both
-// halves are paired: their matched channels each receive the other
-// half and the entry is cleared. Otherwise self is parked until peer
-// arrives or ForwardResumeWindow elapses (in which case matched is
-// closed and the half is discarded).
+// Submit registers half. Only ONE side of a paired submission drives
+// the post-match work — by convention the second arrival. The first
+// arrival's matched channel is closed (its read returns (nil, false))
+// so its handler can bail out without re-doing the allocation grant.
+// The expiry path is identical to the "first arrival never paired"
+// case from the handler's perspective but sets half.timedOut so the
+// handler can distinguish it from "peer drove already" for metrics.
+//
+// Otherwise self is parked until peer arrives or ForwardResumeWindow
+// elapses.
 func (m *forwardMatcher) Submit(self *halfForwardResume) <-chan *halfForwardResume {
 	self.matched = make(chan *halfForwardResume, 1)
 	self.arrivedAt = time.Now()
@@ -77,8 +88,12 @@ func (m *forwardMatcher) Submit(self *halfForwardResume) <-chan *halfForwardResu
 	if peer, ok := m.pending[self.id]; ok {
 		delete(m.pending, self.id)
 		m.mu.Unlock()
-		peer.matched <- self
+		// We're the 2nd arrival → drive. Hand the peer to ourselves
+		// and close the 1st arrival's channel (their handler reads
+		// (nil, false), checks timedOut=false, and bails as
+		// non-driver).
 		self.matched <- peer
+		close(peer.matched)
 		return self.matched
 	}
 	m.pending[self.id] = self
@@ -89,12 +104,13 @@ func (m *forwardMatcher) Submit(self *halfForwardResume) <-chan *halfForwardResu
 		defer t.Stop()
 		select {
 		case <-self.matched:
-			// already matched
+			// already matched (2nd arrival closed our channel)
 		case <-t.C:
 			m.mu.Lock()
 			if cur, ok := m.pending[self.id]; ok && cur == self {
 				delete(m.pending, self.id)
 				m.mu.Unlock()
+				self.timedOut = true
 				close(self.matched)
 				return
 			}

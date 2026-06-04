@@ -21,7 +21,13 @@ import (
 	"github.com/boanlab/outrelay-relay/pkg/forward"
 )
 
-func TestForwardMatcherPairsBothHalves(t *testing.T) {
+// TestForwardMatcherPairsSecondArrivalDrives — when both halves
+// submit, only the 2nd arrival receives the peer (it drives the
+// allocation grant). The 1st arrival's channel is closed without a
+// value so its handler can bail as non-driver. timedOut stays false
+// on the 1st arrival so it doesn't mistakenly bump the timeout
+// counter.
+func TestForwardMatcherPairsSecondArrivalDrives(t *testing.T) {
 	t.Parallel()
 	m := newForwardMatcher()
 	id := resume.StreamID(0xcafef00d)
@@ -38,13 +44,23 @@ func TestForwardMatcherPairsBothHalves(t *testing.T) {
 	chA := m.Submit(a)
 	chB := m.Submit(b)
 
-	gotA := waitMatchForward(t, chA, time.Second)
+	// b is the 2nd arrival → drives, receives a as its peer.
 	gotB := waitMatchForward(t, chB, time.Second)
-	if gotA != b {
-		t.Fatalf("a paired with %v, want b", gotA)
-	}
 	if gotB != a {
 		t.Fatalf("b paired with %v, want a", gotB)
+	}
+
+	// a is the 1st arrival → channel closes without value.
+	select {
+	case got, ok := <-chA:
+		if ok || got != nil {
+			t.Fatalf("a expected closed-without-send (non-driver), got got=%v ok=%v", got, ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a's channel never resolved")
+	}
+	if a.timedOut {
+		t.Fatal("a.timedOut set; non-driver path must not mark timeout")
 	}
 	if m.PendingCount() != 0 {
 		t.Fatalf("pending=%d, want 0", m.PendingCount())
@@ -52,7 +68,9 @@ func TestForwardMatcherPairsBothHalves(t *testing.T) {
 }
 
 // TestForwardMatcherPendingUntilPeer — a lone half parks; the matched
-// channel must not fire until the peer arrives.
+// channel must not fire until the peer arrives. When the peer does
+// arrive, the lone half is the 1st arrival and its channel closes
+// without value (the peer drives).
 func TestForwardMatcherPendingUntilPeer(t *testing.T) {
 	t.Parallel()
 	m := newForwardMatcher()
@@ -65,10 +83,20 @@ func TestForwardMatcherPendingUntilPeer(t *testing.T) {
 	}
 
 	b := &halfForwardResume{id: id, agentURI: "b"}
-	_ = m.Submit(b)
+	chB := m.Submit(b)
 
-	if waitMatchForward(t, chA, time.Second) != b {
-		t.Fatal("a did not pair with b")
+	// b drives — peer is a.
+	if got := waitMatchForward(t, chB, time.Second); got != a {
+		t.Fatalf("b paired with %v, want a", got)
+	}
+	// a's channel is closed without value (it's non-driver).
+	select {
+	case got, ok := <-chA:
+		if ok || got != nil {
+			t.Fatalf("a non-driver path: got got=%v ok=%v", got, ok)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a's channel never closed after peer arrived")
 	}
 }
 

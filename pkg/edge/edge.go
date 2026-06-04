@@ -1083,16 +1083,23 @@ func (s *Server) handleForwardResume(ac *AgentConn, f *orp.Frame) {
 // driveForwardResume submits self to the forwardMatcher and, when the
 // peer arrives, issues fresh allocations + AllocGranted to both. Runs
 // in its own goroutine so the controlLoop is never blocked on the
-// match window. Timeout is observable through the
-// stream_forward_resume_timeout_total counter.
+// match window.
+//
+// Both halves submit concurrently but only the 2nd arrival drives —
+// the matcher closes the 1st arrival's channel so it bails here
+// (read returns (nil, false), timedOut stays false). The matcher
+// flags timedOut on the half whose window actually elapsed; only
+// that path bumps stream_forward_resume_timeout_total.
 func (s *Server) driveForwardResume(self *halfForwardResume) {
 	peer, ok := <-s.forwardResumer.Submit(self)
 	if !ok || peer == nil {
-		if s.metrics != nil {
-			s.metrics.streamForwardResumeTimeout.Inc()
+		if self.timedOut {
+			if s.metrics != nil {
+				s.metrics.streamForwardResumeTimeout.Inc()
+			}
+			s.logger.Warn("edge: FORWARD_RESUME match window expired",
+				"stream_id", uint64(self.id), "from", self.agentURI)
 		}
-		s.logger.Warn("edge: FORWARD_RESUME match window expired",
-			"stream_id", uint64(self.id), "from", self.agentURI)
 		return
 	}
 	if s.metrics != nil {

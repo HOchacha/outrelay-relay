@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/boanlab/OutRelay/lib/control/v1"
@@ -49,6 +50,7 @@ func main() {
 		keyPath         = flag.String("key", "", "PEM-encoded server key")
 		caPath          = flag.String("ca", "", "PEM-encoded CA bundle for client cert verification")
 		controllerAddr  = flag.String("controller", "127.0.0.1:7444", "controller gRPC address")
+		controllerTLS   = flag.Bool("controller-tls", false, "dial the controller over mTLS using this relay's --cert/--key/--ca (default: insecure plaintext for backward compat with dev setups). Set when the controller was started with -cert/-key/-ca.")
 		relayID         = flag.String("relay-id", "", "this relay's id (advertised via UpsertRelay; defaults to listen addr)")
 		region          = flag.String("region", "local", "this relay's region label")
 		advertised      = flag.String("advertise", "", "endpoint advertised to agents (defaults to --listen)")
@@ -81,8 +83,19 @@ func main() {
 	ctx, cancel := signalContext()
 	defer cancel()
 
+	ctrlCreds, err := controllerCreds(*controllerTLS, tlsConf)
+	if err != nil {
+		logger.Error("relay: build controller creds", "err", err)
+		os.Exit(1)
+	}
+	if *controllerTLS {
+		logger.Info("relay: controller gRPC over mTLS", "addr", *controllerAddr)
+	} else {
+		logger.Warn("relay: controller gRPC plaintext — pair with controller-side -cert/-key/-ca and set -controller-tls for production",
+			"addr", *controllerAddr)
+	}
 	cc, err := grpc.NewClient(*controllerAddr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(ctrlCreds),
 	)
 	if err != nil {
 		logger.Error("dial controller", "addr", *controllerAddr, "err", err)
@@ -203,16 +216,76 @@ func main() {
 	}
 }
 
+// controllerCreds picks the gRPC transport credentials for the
+// controller dial. When mTLS is requested it derives a client config
+// from the relay's existing serverConf — same cert (which carries
+// this relay's URI SAN, satisfying the controller's
+// RequireAndVerifyClientCert) and same trust pool. When mTLS is
+// disabled it returns plaintext credentials so dev setups continue
+// to work without controller-side -cert/-key/-ca.
+//
+// ServerName defaults to "localhost" matching dev-pki's DNS SAN —
+// production should override (e.g., via cert with a controller URI
+// SAN) but this baseline keeps the in-tree e2e harnesses working.
+func controllerCreds(enableTLS bool, serverConf *tls.Config) (credentials.TransportCredentials, error) {
+	if !enableTLS {
+		return insecure.NewCredentials(), nil
+	}
+	if serverConf == nil {
+		return nil, fmt.Errorf("relay: -controller-tls requires -cert/-key/-ca to be set")
+	}
+	c := serverConf.Clone()
+	c.ClientCAs = nil
+	c.ClientAuth = 0
+	c.RootCAs = serverConf.ClientCAs
+	c.ServerName = "localhost"
+	return credentials.NewTLS(c), nil
+}
+
 // intraTLS builds a client tls.Config from the relay's server config —
 // same cert (which carries the relay's URI SAN), same CA pool. Used
 // as the dial config for inter-relay connections.
+//
+// ServerName stays "localhost" so dev-pki's DNS-SAN cert chain still
+// verifies, but a VerifyConnection callback additionally enforces that
+// the peer's leaf cert carries a relay-role URI SAN
+// (`outrelay://<tenant>/relay/<id>`). Without that check the
+// inter-relay dial would accept any agent's leaf cert as a peer relay,
+// since both kinds chain to the same CA in a typical deployment.
 func intraTLS(serverConf *tls.Config) *tls.Config {
 	c := serverConf.Clone()
 	c.ClientCAs = nil
 	c.ClientAuth = 0
 	c.RootCAs = serverConf.ClientCAs
 	c.ServerName = "localhost"
+	c.VerifyConnection = verifyPeerIsRelay
 	return c
+}
+
+// verifyPeerIsRelay checks that the peer's verified leaf cert carries
+// at least one URI SAN of the form outrelay://<tenant>/relay/<id>.
+// Runs after Go's default chain verification so the cert is already
+// known to be CA-signed; this only rejects agent-role certs from
+// being accepted as peer relays.
+func verifyPeerIsRelay(cs tls.ConnectionState) error {
+	if len(cs.VerifiedChains) == 0 || len(cs.VerifiedChains[0]) == 0 {
+		return fmt.Errorf("intra: peer presented no verified chain")
+	}
+	leaf := cs.VerifiedChains[0][0]
+	for _, u := range leaf.URIs {
+		if u == nil {
+			continue
+		}
+		// Scheme + path shape: outrelay://<tenant>/relay/<id>.
+		// We intentionally accept any tenant — the trust domain is
+		// already constrained by the CA pool; further per-tenant
+		// scoping is a controller-side concern.
+		if u.Scheme == "outrelay" && len(u.Path) > len("/relay/") &&
+			u.Path[:len("/relay/")] == "/relay/" {
+			return nil
+		}
+	}
+	return fmt.Errorf("intra: peer leaf has no relay URI SAN (got %v)", leaf.URIs)
 }
 
 func loadServerTLS(certPath, keyPath, caPath string) (*tls.Config, error) {
