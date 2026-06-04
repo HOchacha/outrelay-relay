@@ -34,38 +34,61 @@ type HalfCloser interface {
 }
 
 // Bidirectional pipes a <-> b until either side EOFs or errors. It
-// returns the first non-EOF error observed, or nil if both directions
-// closed cleanly.
+// returns the total bytes copied across both directions (consumer→
+// provider + provider→consumer) and the first non-EOF error observed,
+// or nil if both directions closed cleanly.
+//
+// The byte total feeds the relay's bytes_forwarded counter for
+// throughput observability. It counts payload bytes only — the
+// 8-byte ORP frame headers consumed before splice begins are not
+// included.
 //
 // Both streams are left to the caller to close fully — Bidirectional
 // only signals half-close (CloseWrite) on the destination once the
 // source EOFs, so the peer learns that no more data is coming.
-func Bidirectional(a, b io.ReadWriter) error {
-	errCh := make(chan error, 2)
-	go func() { errCh <- copyOne(b, a) }() // a -> b
-	go func() { errCh <- copyOne(a, b) }() // b -> a
+func Bidirectional(a, b io.ReadWriter) (int64, error) {
+	type copyResult struct {
+		n   int64
+		err error
+	}
+	resCh := make(chan copyResult, 2)
+	go func() {
+		n, err := copyOne(b, a)
+		resCh <- copyResult{n: n, err: err}
+	}() // a -> b
+	go func() {
+		n, err := copyOne(a, b)
+		resCh <- copyResult{n: n, err: err}
+	}() // b -> a
 
-	var firstErr error
+	var (
+		total    int64
+		firstErr error
+	)
 	for range 2 {
-		if err := <-errCh; err != nil && firstErr == nil {
-			firstErr = err
+		r := <-resCh
+		total += r.n
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
 		}
 	}
-	return firstErr
+	return total, firstErr
 }
 
 // copyOne copies src -> dst using a pooled buffer, then half-closes
-// dst's write side if supported. EOF is normal completion.
-func copyOne(dst io.Writer, src io.Reader) error {
+// dst's write side if supported. EOF is normal completion. Returns
+// the number of bytes copied even when an error follows so the caller
+// can still account for partial transfers.
+func copyOne(dst io.Writer, src io.Reader) (int64, error) {
 	bufp := bufPool.Get().(*[]byte)
 	defer bufPool.Put(bufp)
 
-	_, err := io.CopyBuffer(dst, src, *bufp)
+	n, err := io.CopyBuffer(dst, src, *bufp)
 	if hc, ok := dst.(HalfCloser); ok {
 		_ = hc.CloseWrite()
 	}
 	if err == nil || errors.Is(err, io.EOF) {
-		return nil
+		return n, nil
 	}
-	return err
+	return n, err
 }

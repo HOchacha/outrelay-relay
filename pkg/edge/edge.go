@@ -74,14 +74,18 @@ type streamPair struct {
 // relayMetrics holds the named instances we touch on the hot path.
 // Pulled into a struct so each lookup happens once at construction.
 type relayMetrics struct {
-	streamOpenDuration *observe.Histogram
-	streamActive       *observe.Gauge
-	policyEvalDuration *observe.Histogram
-	policyCacheHits    *observe.Counter
-	policyCacheMisses  *observe.Counter
-	bytesForwarded     *observe.Counter
-	intraRelayHops     *observe.Counter
-	streamRejects      *observe.Counter
+	streamOpenDuration    *observe.Histogram
+	streamActive          *observe.Gauge
+	policyEvalDuration    *observe.Histogram
+	policyCacheHits       *observe.Counter
+	policyCacheMisses     *observe.Counter
+	bytesForwarded        *observe.Counter
+	intraRelayHops        *observe.Counter
+	streamRejects         *observe.Counter
+	streamOpens           *observe.Counter
+	streamMigratedP2P     *observe.Counter
+	streamMigratedRelay   *observe.Counter
+	streamForwardAssigned *observe.Counter
 }
 
 func newRelayMetrics(reg *observe.Registry) *relayMetrics {
@@ -89,14 +93,18 @@ func newRelayMetrics(reg *observe.Registry) *relayMetrics {
 		return nil
 	}
 	return &relayMetrics{
-		streamOpenDuration: reg.Histogram("stream_open_duration"),
-		streamActive:       reg.Gauge("stream_active"),
-		policyEvalDuration: reg.Histogram("policy_eval_duration"),
-		policyCacheHits:    reg.Counter("policy_cache_hits"),
-		policyCacheMisses:  reg.Counter("policy_cache_misses"),
-		bytesForwarded:     reg.Counter("bytes_forwarded"),
-		intraRelayHops:     reg.Counter("intra_relay_hops"),
-		streamRejects:      reg.Counter("stream_rejects"),
+		streamOpenDuration:    reg.Histogram("stream_open_duration"),
+		streamActive:          reg.Gauge("stream_active"),
+		policyEvalDuration:    reg.Histogram("policy_eval_duration"),
+		policyCacheHits:       reg.Counter("policy_cache_hits"),
+		policyCacheMisses:     reg.Counter("policy_cache_misses"),
+		bytesForwarded:        reg.Counter("bytes_forwarded"),
+		intraRelayHops:        reg.Counter("intra_relay_hops"),
+		streamRejects:         reg.Counter("stream_rejects"),
+		streamOpens:           reg.Counter("stream_opens_total"),
+		streamMigratedP2P:     reg.Counter("stream_migrated_p2p_total"),
+		streamMigratedRelay:   reg.Counter("stream_migrated_relay_total"),
+		streamForwardAssigned: reg.Counter("stream_forward_assigned_total"),
 	}
 }
 
@@ -298,6 +306,19 @@ func (s *Server) serveConn(ctx context.Context, conn transport.Conn) {
 	}
 }
 
+// writeStreamReject sends STREAM_REJECT and bumps the stream_rejects
+// counter. The write error is intentionally discarded — at the point
+// we reject, the stream is being torn down anyway and any further
+// frames on it would be lost.
+func (s *Server) writeStreamReject(st transport.Stream, code uint32, reason string) {
+	_ = orp.WriteFrame(st, orp.FrameTypeStreamReject, &orpv1.StreamReject{
+		Code: code, Reason: reason,
+	})
+	if s.metrics != nil {
+		s.metrics.streamRejects.Inc()
+	}
+}
+
 func (s *Server) controlLoop(ctx context.Context, ac *AgentConn, ctrl transport.Stream) {
 	for {
 		f, err := orp.ParseFrame(ctrl)
@@ -391,6 +412,9 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	}
 	s.logger.Debug("edge: OPEN_STREAM received",
 		"caller", caller.uri, "target", open.TargetService, "method", open.Method)
+	if s.metrics != nil {
+		s.metrics.streamOpens.Inc()
+	}
 
 	// Caller-side policy check first — if the consumer's view denies,
 	// we never bother resolving.
@@ -400,9 +424,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		dec := s.evaluate(caller.uri, open.TargetService, open.Method)
 		s.recordAudit(caller.uri, open.TargetService, open.Method, dec)
 		if dec.Decision == policy.DecisionDeny {
-			_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-				Code: 403, Reason: "denied: " + dec.Reason,
-			})
+			s.writeStreamReject(consumerStream, 403, "denied: "+dec.Reason)
 			return
 		}
 		p2pMode = dec.P2PMode
@@ -416,18 +438,14 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	prov, remote, err := s.reg.Resolve(ctx, caller.uri, open.TargetService)
 	if errors.Is(err, registry.ErrProviderRemote) {
 		if s.pool == nil || remote == nil || remote.Endpoint == "" {
-			_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-				Code: 502, Reason: "inter-relay forwarding unavailable",
-			})
+			s.writeStreamReject(consumerStream, 502, "inter-relay forwarding unavailable")
 			return
 		}
 		s.forwardToPeer(ctx, caller.uri, open, consumerStream, remote)
 		return
 	}
 	if err != nil {
-		_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-			Code: 404, Reason: "service not found",
-		})
+		s.writeStreamReject(consumerStream, 404, "service not found")
 		return
 	}
 	// Callee-side policy check — now that we know the resolved
@@ -442,9 +460,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 			"decision", callee.Decision.String(), "relay_mode", callee.RelayMode.String(),
 			"p2p_mode", callee.P2PMode.String(), "reason", callee.Reason)
 		if callee.Decision == policy.DecisionDeny {
-			_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-				Code: 403, Reason: "denied (callee): " + callee.Reason,
-			})
+			s.writeStreamReject(consumerStream, 403, "denied (callee): "+callee.Reason)
 			return
 		}
 		p2pMode = policy.CombineP2PModes(p2pMode, callee.P2PMode)
@@ -479,9 +495,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		s.logger.Warn("edge: OpenIncoming failed",
 			"stream_id", open.StreamId, "consumer", caller.uri,
 			"provider", prov.AgentURI(), "service", open.TargetService, "err", err)
-		_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-			Code: 502, Reason: "provider stream open failed",
-		})
+		s.writeStreamReject(consumerStream, 502, "provider stream open failed")
 		return
 	}
 	s.logger.Debug("edge: OpenIncoming ok",
@@ -496,9 +510,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	if !s.recordPair(open.StreamId, pair) {
 		s.logger.Warn("stream id collision rejected",
 			"stream_id", open.StreamId, "consumer", caller.uri, "provider", prov.AgentURI())
-		_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-			Code: 409, Reason: "stream id collision",
-		})
+		s.writeStreamReject(consumerStream, 409, "stream id collision")
 		return
 	}
 	s.logger.Debug("edge: stream pair recorded",
@@ -533,9 +545,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	case orp.FrameTypeStreamReject:
 		s.logger.Info("edge: provider rejected stream",
 			"caller", caller.uri, "provider", prov.AgentURI(), "stream_id", open.StreamId)
-		_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-			Code: 503, Reason: "provider rejected",
-		})
+		s.writeStreamReject(consumerStream, 503, "provider rejected")
 		return
 	default:
 		s.logger.Warn("edge: unexpected provider ack frame",
@@ -554,15 +564,16 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		if provAC == nil {
 			s.logger.Warn("edge: forward — provider control channel unavailable",
 				"caller", caller.uri, "provider", prov.AgentURI(), "stream_id", open.StreamId)
-			_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-				Code: 502, Reason: "forward: provider control channel unavailable",
-			})
+			s.writeStreamReject(consumerStream, 502, "forward: provider control channel unavailable")
 			return
 		}
 		consumerAlloc := s.forward.Allocate()
 		providerAlloc := s.forward.Allocate()
 		defer s.forward.Forget(consumerAlloc)
 		defer s.forward.Forget(providerAlloc)
+		if s.metrics != nil {
+			s.metrics.streamForwardAssigned.Inc()
+		}
 
 		fwdEndpoint := s.forward.Endpoint().String()
 		s.logger.Info("edge: forward — allocations granted",
@@ -615,7 +626,10 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		_ = provAC.WriteCtrl(orp.FrameTypeStreamReady, &orpv1.StreamReady{StreamId: open.StreamId})
 	}
 
-	_ = splice.Bidirectional(consumerStream, provStream)
+	n, _ := splice.Bidirectional(consumerStream, provStream)
+	if s.metrics != nil {
+		s.metrics.bytesForwarded.Add(n)
+	}
 }
 
 // AgentConn is the relay's view of one connected agent. It implements
@@ -757,32 +771,29 @@ func (s *Server) handleForwardedStream(ctx context.Context, peerStream transport
 	// the provider to be on this relay's local agent map.
 	prov, remote, err := s.reg.Resolve(ctx, in.SourceAgentUri, in.TargetService)
 	if err != nil || remote != nil {
-		_ = orp.WriteFrame(peerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-			Code: 503, Reason: "no local provider for forwarded stream",
-		})
+		s.writeStreamReject(peerStream, 503, "no local provider for forwarded stream")
 		return
 	}
 
 	provStream, err := prov.OpenIncoming(in.TargetService, in.Method, in.SourceAgentUri, in.StreamId)
 	if err != nil {
-		_ = orp.WriteFrame(peerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-			Code: 502, Reason: "provider open failed",
-		})
+		s.writeStreamReject(peerStream, 502, "provider open failed")
 		return
 	}
 	defer func() { _ = provStream.Close() }()
 
 	ack, err := orp.ParseFrame(provStream)
 	if err != nil || ack.Type != orp.FrameTypeStreamAccept {
-		_ = orp.WriteFrame(peerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-			Code: 503, Reason: "provider rejected",
-		})
+		s.writeStreamReject(peerStream, 503, "provider rejected")
 		return
 	}
 	if err := orp.WriteFrame(peerStream, orp.FrameTypeStreamAccept, &orpv1.StreamAccept{}); err != nil {
 		return
 	}
-	_ = splice.Bidirectional(peerStream, provStream)
+	n, _ := splice.Bidirectional(peerStream, provStream)
+	if s.metrics != nil {
+		s.metrics.bytesForwarded.Add(n)
+	}
 }
 
 // forwardToPeer opens a forwarded stream on the cached peer-relay
@@ -796,9 +807,7 @@ func (s *Server) forwardToPeer(ctx context.Context, callerURI string, open *orpv
 	peer, err := s.pool.Get(ctx, remote.RelayID, remote.Endpoint)
 	if err != nil {
 		s.logger.Warn("dial peer relay", "id", remote.RelayID, "err", err)
-		_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-			Code: 502, Reason: "peer relay unreachable",
-		})
+		s.writeStreamReject(consumerStream, 502, "peer relay unreachable")
 		return
 	}
 	peerStream, err := intra.ForwardStream(ctx, peer, open.TargetService, open.Method, callerURI)
@@ -806,13 +815,14 @@ func (s *Server) forwardToPeer(ctx context.Context, callerURI string, open *orpv
 		s.logger.Warn("forward to peer", "id", remote.RelayID, "err", err)
 		// Cached conn may be dead; drop so the next attempt redials.
 		s.pool.Drop(remote.RelayID)
-		_ = orp.WriteFrame(consumerStream, orp.FrameTypeStreamReject, &orpv1.StreamReject{
-			Code: 502, Reason: "peer relay forward failed",
-		})
+		s.writeStreamReject(consumerStream, 502, "peer relay forward failed")
 		return
 	}
 	defer peerStream.Close()
-	_ = splice.Bidirectional(consumerStream, peerStream)
+	n, _ := splice.Bidirectional(consumerStream, peerStream)
+	if s.metrics != nil {
+		s.metrics.bytesForwarded.Add(n)
+	}
 }
 
 // forwardCandidate routes a CANDIDATE_OFFER or CANDIDATE_ANSWER
@@ -1009,6 +1019,9 @@ func (s *Server) handleMigrateToP2P(ac *AgentConn, f *orp.Frame) {
 		consumerURI: pair.consumerURI,
 		providerURI: pair.providerURI,
 	})
+	if s.metrics != nil {
+		s.metrics.streamMigratedP2P.Inc()
+	}
 	s.logger.Info("stream migrated to p2p", "stream_id", m.StreamId, "by", ac.uri)
 }
 
@@ -1029,6 +1042,9 @@ func (s *Server) handleMigrateToRelay(st transport.Stream, f *orp.Frame) {
 			"stream_id", m.StreamId, "reason", m.Reason,
 			"prior_consumer", prior.consumerURI, "prior_provider", prior.providerURI)
 	}
+	if s.metrics != nil {
+		s.metrics.streamMigratedRelay.Inc()
+	}
 	half := &halfStream{
 		id:         id,
 		stream:     st,
@@ -1043,7 +1059,10 @@ func (s *Server) handleMigrateToRelay(st transport.Stream, f *orp.Frame) {
 	if prior != nil {
 		s.migrated.Discard(id)
 	}
-	_ = splice.Bidirectional(st, matched.stream)
+	n, _ := splice.Bidirectional(st, matched.stream)
+	if s.metrics != nil {
+		s.metrics.bytesForwarded.Add(n)
+	}
 	_ = st.Close()
 	_ = matched.stream.Close()
 }
@@ -1092,7 +1111,10 @@ func (s *Server) handleResumeHalf(_ context.Context, st transport.Stream, f *orp
 		MyPosition:      uint64(matched.myPos),      // #nosec G115 -- byte count, never negative
 		PeerAckPosition: uint64(matched.peerAckPos), // #nosec G115 -- byte count, never negative
 	})
-	_ = splice.Bidirectional(st, matched.stream)
+	n, _ := splice.Bidirectional(st, matched.stream)
+	if s.metrics != nil {
+		s.metrics.bytesForwarded.Add(n)
+	}
 	_ = st.Close()
 	_ = matched.stream.Close()
 }
