@@ -232,6 +232,128 @@ func TestRegisterDrainsQueuedPunch(t *testing.T) {
 	}
 }
 
+// TestForgetReapsPendingAndQueued — Forget on a single alloc must
+// also drop any pending / queued register state for that id, so the
+// maps don't outlive the live byAlloc set.
+func TestForgetReapsPendingAndQueued(t *testing.T) {
+	t.Parallel()
+	p := newTestPlane(t)
+	uri := "outrelay://acme/agent/a"
+	id := p.Allocate(uri)
+	nonce := [PunchNonceSize]byte{0x11}
+
+	// Path 1: pending armed but no punch yet → Forget should clear it.
+	if err := p.ArmPending(id, uri, nonce); err != nil {
+		t.Fatalf("ArmPending: %v", err)
+	}
+	p.mu.RLock()
+	_, hadPending := p.pending[id]
+	p.mu.RUnlock()
+	if !hadPending {
+		t.Fatal("ArmPending did not install pending entry")
+	}
+	p.Forget(id)
+	p.mu.RLock()
+	_, stillPending := p.pending[id]
+	p.mu.RUnlock()
+	if stillPending {
+		t.Fatal("Forget left pending entry behind")
+	}
+
+	// Path 2: queued punch (punch arrived first) → Forget should clear it.
+	id2 := p.Allocate(uri)
+	p.register(id2, netip.MustParseAddrPort("10.0.0.1:9001"), nonce)
+	p.mu.RLock()
+	_, hadQueued := p.queued[id2]
+	p.mu.RUnlock()
+	if !hadQueued {
+		t.Fatal("register did not queue punch")
+	}
+	p.Forget(id2)
+	p.mu.RLock()
+	_, stillQueued := p.queued[id2]
+	p.mu.RUnlock()
+	if stillQueued {
+		t.Fatal("Forget left queued punch behind")
+	}
+}
+
+// TestForgetAgentReapsPendingAndQueued — bulk teardown by URI drains
+// pending / queued for every alloc the URI owned.
+func TestForgetAgentReapsPendingAndQueued(t *testing.T) {
+	t.Parallel()
+	p := newTestPlane(t)
+	uri := "outrelay://acme/agent/doomed"
+	a := p.Allocate(uri)
+	b := p.Allocate(uri)
+	nonce := [PunchNonceSize]byte{0x22}
+	if err := p.ArmPending(a, uri, nonce); err != nil {
+		t.Fatalf("ArmPending a: %v", err)
+	}
+	p.register(b, netip.MustParseAddrPort("10.0.0.1:9001"), nonce)
+
+	if got := p.ForgetAgent(uri); got != 2 {
+		t.Fatalf("ForgetAgent released %d, want 2", got)
+	}
+	p.mu.RLock()
+	_, stillPending := p.pending[a]
+	_, stillQueued := p.queued[b]
+	p.mu.RUnlock()
+	if stillPending {
+		t.Fatal("ForgetAgent left pending entry behind")
+	}
+	if stillQueued {
+		t.Fatal("ForgetAgent left queued punch behind")
+	}
+}
+
+// TestGCOnceReapsExpiredPendingAndQueued — pending / queued entries
+// past their expiry are swept by the GC ticker even when no register
+// or ArmPending call lazy-checks them.
+func TestGCOnceReapsExpiredPendingAndQueued(t *testing.T) {
+	t.Parallel()
+	p := newTestPlane(t)
+	p.idleTTL = time.Hour    // keep byAlloc out of this test
+	p.pendingTTL = time.Hour // we'll backdate manually
+
+	uri := "outrelay://acme/agent/a"
+	a := p.Allocate(uri)
+	b := p.Allocate(uri)
+	nonce := [PunchNonceSize]byte{0x33}
+
+	if err := p.ArmPending(a, uri, nonce); err != nil {
+		t.Fatalf("ArmPending: %v", err)
+	}
+	p.register(b, netip.MustParseAddrPort("10.0.0.1:9001"), nonce)
+
+	// Backdate both into the past so gcOnce treats them as expired.
+	p.mu.Lock()
+	p.pending[a].expires = time.Now().Add(-time.Second)
+	p.queued[b].expires = time.Now().Add(-time.Second)
+	p.mu.Unlock()
+
+	p.gcOnce(time.Now())
+
+	p.mu.RLock()
+	_, stillPending := p.pending[a]
+	_, stillQueued := p.queued[b]
+	p.mu.RUnlock()
+	if stillPending {
+		t.Fatal("gcOnce did not reap expired pending entry")
+	}
+	if stillQueued {
+		t.Fatal("gcOnce did not reap expired queued punch")
+	}
+	// The underlying allocs themselves must survive — only the
+	// arm/queue rows were due for eviction.
+	if _, ok := p.OwnerOf(a); !ok {
+		t.Fatal("gcOnce wrongly evicted a live alloc")
+	}
+	if _, ok := p.OwnerOf(b); !ok {
+		t.Fatal("gcOnce wrongly evicted a live alloc")
+	}
+}
+
 // allocEntryAtomicSanity is a sanity check that the in-place
 // atomic.Int64 on allocEntry is safe under the access pattern used by
 // gcOnce + register (concurrent Store + Load).

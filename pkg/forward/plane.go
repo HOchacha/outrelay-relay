@@ -268,6 +268,11 @@ func (p *Plane) Allocate(uri string) uint32 {
 		p.logger.Warn("forward: alloc id wraparound (skipping 0)")
 	}
 	entry := &allocEntry{uri: uri}
+	// Initialise lastSeen to "now" so a freshly issued alloc waiting
+	// for its register packet survives a full idleTTL window. Without
+	// this the GC sees lastSeen=0 < cutoff and reaps the entry on the
+	// very next tick, even though the agent simply hasn't punched yet.
+	entry.lastSeen.Store(time.Now().UnixNano())
 	p.mu.Lock()
 	p.byAlloc[id] = entry
 	set, ok := p.byURI[uri]
@@ -283,7 +288,9 @@ func (p *Plane) Allocate(uri string) uint32 {
 
 // Forget releases a single allocation. Subsequent packets prefixed
 // with this id are dropped. Called from edge.go when the underlying
-// stream tears down.
+// stream tears down. Any pending / queued register state for the
+// alloc is reaped as well so memory tracks the live byAlloc set
+// rather than waiting on TTL expiry.
 func (p *Plane) Forget(id uint32) {
 	p.mu.Lock()
 	entry, existed := p.byAlloc[id]
@@ -297,6 +304,8 @@ func (p *Plane) Forget(id uint32) {
 			}
 		}
 	}
+	delete(p.pending, id)
+	delete(p.queued, id)
 	p.mu.Unlock()
 	// `existed=false` after the first Forget is normal when the agent
 	// never sent its registration packet; a second Forget for the same
@@ -310,7 +319,9 @@ func (p *Plane) Forget(id uint32) {
 }
 
 // ForgetAgent releases every allocation owned by uri in one shot.
-// Returns the number of allocations actually released.
+// Returns the number of allocations actually released. Also drains
+// any pending / queued register state owned by uri so the maps don't
+// linger past the agent's lifetime.
 //
 // Called from edge.go's serveConn defer the moment an agent's control
 // connection drops, so an agent that crashes without graceful teardown
@@ -334,9 +345,14 @@ func (p *Plane) ForgetAgent(uri string) int {
 		}
 		delete(p.byAlloc, id)
 		delete(p.src2id, entry.src)
+		delete(p.pending, id)
+		delete(p.queued, id)
 		released++
 	}
 	delete(p.byURI, uri)
+	// Stray pending / queued entries that survived because their alloc
+	// already got Forget'd elsewhere are scrubbed by gcOnce; nothing
+	// else to do here.
 	p.mu.Unlock()
 	if released > 0 {
 		p.logger.Info("forward: bulk teardown", "uri", uri, "released", released)
@@ -464,7 +480,8 @@ func (p *Plane) gcLoop(ctx context.Context) {
 }
 
 // gcOnce evicts entries whose lastSeen is older than idleTTL relative
-// to now. Holds the write lock for the scan. Keeps byURI in sync.
+// to now and reaps any expired pending / queued register state. Holds
+// the write lock for the scan. Keeps byURI in sync.
 func (p *Plane) gcOnce(now time.Time) {
 	cutoff := now.Add(-p.idleTTL).UnixNano()
 	p.mu.Lock()
@@ -479,9 +496,27 @@ func (p *Plane) gcOnce(now time.Time) {
 					delete(p.byURI, entry.uri)
 				}
 			}
+			delete(p.pending, id)
+			delete(p.queued, id)
 			p.logger.Info("forward: allocation idle-timeout",
 				"alloc_id", id, "uri", entry.uri, "src", entry.src.String(),
 				"idle_s", int(now.Sub(time.Unix(0, entry.lastSeen.Load())).Seconds()))
+		}
+	}
+	// pending / queued live independently of byAlloc — an agent that
+	// arms a pending entry and then crashes before its alloc gets
+	// Forget'd would otherwise leak the pending row until the next
+	// ArmPending / register touched it. Sweep expired ones here.
+	for id, pend := range p.pending {
+		if now.After(pend.expires) {
+			delete(p.pending, id)
+			p.logger.Debug("forward: pending entry GC", "alloc_id", id, "uri", pend.uri)
+		}
+	}
+	for id, q := range p.queued {
+		if now.After(q.expires) {
+			delete(p.queued, id)
+			p.logger.Debug("forward: queued punch GC", "alloc_id", id, "src", q.src.String())
 		}
 	}
 }
