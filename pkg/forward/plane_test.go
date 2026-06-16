@@ -35,8 +35,8 @@ func TestPlaneForwarding(t *testing.T) {
 
 	// Two pre-allocated ids (the relay would normally hand these
 	// out via AllocGranted to the consumer / provider agents).
-	allocA := plane.Allocate()
-	allocB := plane.Allocate()
+	allocA := plane.Allocate("outrelay://acme/agent/aaa")
+	allocB := plane.Allocate("outrelay://acme/agent/bbb")
 	if allocA == 0 || allocB == 0 || allocA == allocB {
 		t.Fatalf("bad alloc ids: A=%d B=%d", allocA, allocB)
 	}
@@ -139,6 +139,67 @@ func TestPlaneDropsUnregistered(t *testing.T) {
 	recv := make([]byte, 64)
 	if _, _, err := connA.ReadFromUDPAddrPort(recv); !errIsTimeout(err) {
 		t.Fatalf("expected timeout, got %v", err)
+	}
+}
+
+// TestPlaneForgetAgentBulkTeardown — allocations issued to one URI are
+// all released by a single ForgetAgent call, and the returned count
+// matches what was held. Allocations belonging to other URIs are
+// untouched.
+func TestPlaneForgetAgentBulkTeardown(t *testing.T) {
+	t.Parallel()
+
+	plane, err := forward.NewPlane("127.0.0.1:0", slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plane.Close()
+
+	uriDoomed := "outrelay://acme/agent/doomed"
+	uriOther := "outrelay://acme/agent/other"
+
+	a := plane.Allocate(uriDoomed)
+	b := plane.Allocate(uriDoomed)
+	c := plane.Allocate(uriDoomed)
+	keep := plane.Allocate(uriOther)
+
+	if got := plane.ForgetAgent(uriDoomed); got != 3 {
+		t.Fatalf("ForgetAgent returned %d, want 3", got)
+	}
+	for _, id := range []uint32{a, b, c} {
+		if _, ok := plane.OwnerOf(id); ok {
+			t.Fatalf("alloc %d should be gone after ForgetAgent", id)
+		}
+	}
+	if owner, ok := plane.OwnerOf(keep); !ok || owner != uriOther {
+		t.Fatalf("foreign alloc was disturbed: owner=%q ok=%v", owner, ok)
+	}
+	// Idempotent — second call for the same URI is a no-op.
+	if got := plane.ForgetAgent(uriDoomed); got != 0 {
+		t.Fatalf("second ForgetAgent returned %d, want 0", got)
+	}
+}
+
+// TestPlaneOwnerOfRoundTrip — OwnerOf returns the URI passed to
+// Allocate while the entry lives, and reports gone after Forget.
+func TestPlaneOwnerOfRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	plane, err := forward.NewPlane("127.0.0.1:0", slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plane.Close()
+
+	uri := "outrelay://acme/agent/round-trip"
+	id := plane.Allocate(uri)
+	got, ok := plane.OwnerOf(id)
+	if !ok || got != uri {
+		t.Fatalf("OwnerOf(%d) = (%q, %v), want (%q, true)", id, got, ok, uri)
+	}
+	plane.Forget(id)
+	if _, ok := plane.OwnerOf(id); ok {
+		t.Fatalf("OwnerOf(%d) still ok after Forget", id)
 	}
 }
 

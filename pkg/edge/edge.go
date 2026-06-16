@@ -299,6 +299,16 @@ func (s *Server) serveConn(ctx context.Context, conn transport.Conn) {
 	s.logger.Info("agent connected", "uri", uri)
 	defer func() {
 		s.reg.UnregisterAgent(ctx, uri)
+		// S1: drop every forward allocation owned by this agent the
+		// moment its control connection goes away, instead of waiting
+		// out the per-alloc idle TTL. Returns 0 when the agent never
+		// used forward mode, which is the common case.
+		if s.forward != nil {
+			if released := s.forward.ForgetAgent(uri); released > 0 {
+				s.logger.Info("agent disconnected — forward allocations released",
+					"uri", uri, "released", released)
+			}
+		}
 		s.logger.Info("agent disconnected", "uri", uri)
 	}()
 
@@ -582,8 +592,8 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 			s.writeStreamReject(consumerStream, 502, "forward: provider control channel unavailable")
 			return
 		}
-		consumerAlloc := s.forward.Allocate()
-		providerAlloc := s.forward.Allocate()
+		consumerAlloc := s.forward.Allocate(caller.uri)
+		providerAlloc := s.forward.Allocate(provAC.uri)
 		defer s.forward.Forget(consumerAlloc)
 		defer s.forward.Forget(providerAlloc)
 		if s.metrics != nil {
@@ -1106,8 +1116,8 @@ func (s *Server) driveForwardResume(self *halfForwardResume) {
 		s.metrics.streamForwardResumePaired.Inc()
 	}
 
-	selfAlloc := s.forward.Allocate()
-	peerAlloc := s.forward.Allocate()
+	selfAlloc := s.forward.Allocate(self.agentURI)
+	peerAlloc := s.forward.Allocate(peer.agentURI)
 	fwdEndpoint := s.forward.Endpoint().String()
 	streamID := uint64(self.id)
 

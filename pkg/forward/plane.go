@@ -51,23 +51,34 @@ import (
 // still healthy will keep their entry warm.
 const DefaultAllocIdleTTL = 60 * time.Second
 
-// allocEntry records where an allocation is registered and when it was
-// last observed as alive. lastSeen is atomic so the data-path forwarder
-// can bump it under RLock; the GC loop takes the full write lock when
-// it actually evicts.
+// allocEntry records who owns an allocation, where it is registered, and
+// when it was last observed as alive. uri is the cert-verified URI of the
+// agent the allocation was issued to — owner identity is a first-class
+// property of every entry so audit logs, bulk teardown, and (Phase 2)
+// wire-level register verification all share one source of truth.
+// lastSeen is atomic so the data-path forwarder can bump it under RLock;
+// the GC loop takes the full write lock when it actually evicts.
 type allocEntry struct {
+	uri      string // cert URI of the owning agent
 	src      netip.AddrPort
 	lastSeen atomic.Int64 // unix nanos
 }
 
 // Plane is the relay's UDP forwarding plane.
+//
+// All allocations are owned by an agent URI from the moment they are
+// issued. byAlloc is the forwarding-fast-path index; byURI lets the
+// caller release every alloc belonging to a disconnected agent in one
+// call (ForgetAgent). src2id is the reverse data-path index used to
+// bump lastSeen in O(1).
 type Plane struct {
 	udp    *net.UDPConn
 	logger *slog.Logger
 
-	mu     sync.RWMutex
-	allocs map[uint32]*allocEntry    // alloc_id -> entry
-	src2id map[netip.AddrPort]uint32 // reverse index: agent src -> alloc id (for lastSeen bump)
+	mu      sync.RWMutex
+	byAlloc map[uint32]*allocEntry         // alloc_id -> entry
+	byURI   map[string]map[uint32]struct{} // agent URI -> set of allocs
+	src2id  map[netip.AddrPort]uint32      // reverse index: agent src -> alloc id
 
 	nextID  atomic.Uint32
 	idleTTL time.Duration // 0 disables the GC loop
@@ -91,7 +102,8 @@ func NewPlane(addr string, logger *slog.Logger) (*Plane, error) {
 	p := &Plane{
 		udp:     conn,
 		logger:  logger,
-		allocs:  map[uint32]*allocEntry{},
+		byAlloc: map[uint32]*allocEntry{},
+		byURI:   map[string]map[uint32]struct{}{},
 		src2id:  map[netip.AddrPort]uint32{},
 		idleTTL: DefaultAllocIdleTTL,
 	}
@@ -112,37 +124,114 @@ func (p *Plane) Endpoint() netip.AddrPort {
 	return p.udp.LocalAddr().(*net.UDPAddr).AddrPort()
 }
 
-// Allocate returns a fresh allocation id (1+). The agent's
-// registration packet binds this id to its UDP source endpoint.
-func (p *Plane) Allocate() uint32 {
-	for {
-		id := p.nextID.Add(1)
-		if id == 0 {
-			// Wraparound — skip reserved 0.
-			p.logger.Warn("forward: alloc id wraparound (skipping 0)")
-			continue
-		}
-		p.logger.Info("forward: allocation issued", "alloc_id", id)
-		return id
+// Allocate issues a fresh allocation id (1+) owned by uri. The agent's
+// registration packet later binds the id to its UDP source endpoint.
+// uri is the cert-verified URI of the agent the allocation is being
+// issued to; storing it up front lets ForgetAgent, OwnerOf, and Phase 2
+// register verification all share the same authoritative mapping.
+//
+// Allocate panics on empty uri — callers must always pass a verified
+// identity. Callers that don't have a URI yet are misusing the API.
+func (p *Plane) Allocate(uri string) uint32 {
+	if uri == "" {
+		panic("forward: Allocate called with empty URI")
 	}
+	var id uint32
+	for {
+		id = p.nextID.Add(1)
+		if id != 0 {
+			break
+		}
+		// Wraparound — skip reserved 0.
+		p.logger.Warn("forward: alloc id wraparound (skipping 0)")
+	}
+	entry := &allocEntry{uri: uri}
+	p.mu.Lock()
+	p.byAlloc[id] = entry
+	set, ok := p.byURI[uri]
+	if !ok {
+		set = map[uint32]struct{}{}
+		p.byURI[uri] = set
+	}
+	set[id] = struct{}{}
+	p.mu.Unlock()
+	p.logger.Info("forward: allocation issued", "alloc_id", id, "uri", uri)
+	return id
 }
 
-// Forget releases an allocation. Subsequent packets prefixed with
-// this id are dropped. Called from edge.go when the underlying
+// Forget releases a single allocation. Subsequent packets prefixed
+// with this id are dropped. Called from edge.go when the underlying
 // stream tears down.
 func (p *Plane) Forget(id uint32) {
 	p.mu.Lock()
-	entry, existed := p.allocs[id]
+	entry, existed := p.byAlloc[id]
 	if existed {
-		delete(p.allocs, id)
+		delete(p.byAlloc, id)
 		delete(p.src2id, entry.src)
+		if set, ok := p.byURI[entry.uri]; ok {
+			delete(set, id)
+			if len(set) == 0 {
+				delete(p.byURI, entry.uri)
+			}
+		}
 	}
 	p.mu.Unlock()
 	// `existed=false` after the first Forget is normal when the agent
 	// never sent its registration packet; a second Forget for the same
 	// id is a caller bug (double-release).
+	uri := ""
+	if entry != nil {
+		uri = entry.uri
+	}
 	p.logger.Info("forward: allocation released",
-		"alloc_id", id, "was_registered", existed)
+		"alloc_id", id, "uri", uri, "was_registered", existed)
+}
+
+// ForgetAgent releases every allocation owned by uri in one shot.
+// Returns the number of allocations actually released.
+//
+// Called from edge.go's serveConn defer the moment an agent's control
+// connection drops, so an agent that crashes without graceful teardown
+// no longer has to wait out the idle-TTL window (~60s) for its forward
+// resources to be reclaimed.
+func (p *Plane) ForgetAgent(uri string) int {
+	if uri == "" {
+		return 0
+	}
+	p.mu.Lock()
+	set, ok := p.byURI[uri]
+	if !ok {
+		p.mu.Unlock()
+		return 0
+	}
+	released := 0
+	for id := range set {
+		entry, present := p.byAlloc[id]
+		if !present {
+			continue
+		}
+		delete(p.byAlloc, id)
+		delete(p.src2id, entry.src)
+		released++
+	}
+	delete(p.byURI, uri)
+	p.mu.Unlock()
+	if released > 0 {
+		p.logger.Info("forward: bulk teardown", "uri", uri, "released", released)
+	}
+	return released
+}
+
+// OwnerOf returns the URI the allocation was issued to, if it still
+// exists. Used by Phase 2 register verification and by audit logging.
+func (p *Plane) OwnerOf(id uint32) (string, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	entry, ok := p.byAlloc[id]
+	if !ok {
+		return "", false
+	}
+	return entry.uri, true
 }
 
 // Lookup returns the registered endpoint for an allocation id, if
@@ -150,7 +239,7 @@ func (p *Plane) Forget(id uint32) {
 func (p *Plane) Lookup(id uint32) (netip.AddrPort, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
-	entry, ok := p.allocs[id]
+	entry, ok := p.byAlloc[id]
 	if !ok {
 		return netip.AddrPort{}, false
 	}
@@ -206,10 +295,10 @@ func (p *Plane) Run(ctx context.Context) error {
 		// index so the bump stays O(1).
 		now := time.Now().UnixNano()
 		p.mu.RLock()
-		entry, ok := p.allocs[peerAlloc]
+		entry, ok := p.byAlloc[peerAlloc]
 		var senderEntry *allocEntry
 		if senderID, srcOk := p.src2id[srcAP]; srcOk {
-			senderEntry = p.allocs[senderID]
+			senderEntry = p.byAlloc[senderID]
 		}
 		p.mu.RUnlock()
 		if senderEntry != nil {
@@ -233,12 +322,8 @@ func (p *Plane) Run(ctx context.Context) error {
 // under one TTL.
 func (p *Plane) gcLoop(ctx context.Context) {
 	interval := p.idleTTL / 4
-	if interval < time.Second {
-		interval = time.Second
-	}
-	if interval > 5*time.Second {
-		interval = 5 * time.Second
-	}
+	interval = max(interval, time.Second)
+	interval = min(interval, 5*time.Second)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -252,58 +337,67 @@ func (p *Plane) gcLoop(ctx context.Context) {
 }
 
 // gcOnce evicts entries whose lastSeen is older than idleTTL relative
-// to now. Holds the write lock for the scan.
+// to now. Holds the write lock for the scan. Keeps byURI in sync.
 func (p *Plane) gcOnce(now time.Time) {
 	cutoff := now.Add(-p.idleTTL).UnixNano()
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for id, entry := range p.allocs {
+	for id, entry := range p.byAlloc {
 		if entry.lastSeen.Load() < cutoff {
-			delete(p.allocs, id)
+			delete(p.byAlloc, id)
 			delete(p.src2id, entry.src)
+			if set, ok := p.byURI[entry.uri]; ok {
+				delete(set, id)
+				if len(set) == 0 {
+					delete(p.byURI, entry.uri)
+				}
+			}
 			p.logger.Info("forward: allocation idle-timeout",
-				"alloc_id", id, "src", entry.src.String(),
+				"alloc_id", id, "uri", entry.uri, "src", entry.src.String(),
 				"idle_s", int(now.Sub(time.Unix(0, entry.lastSeen.Load())).Seconds()))
 		}
 	}
 }
 
-// register stores the (alloc_id, src_addr) tuple. The plane has
-// no authentication on registration — anyone with the wire
-// protocol and a valid alloc id can claim that slot. Production
-// hardening would require the relay to issue per-stream tokens
-// the agent presents in the registration packet; for the smoke
-// prototype the allocation id itself is treated as a capability.
+// register binds an existing allocation's UDP src endpoint. The entry
+// must already exist — i.e. the relay must have called Allocate(uri)
+// before this packet arrived. A register packet for an unknown alloc is
+// silently dropped: under the URI-primary model, allocations are only
+// born through Allocate (which records the owning URI), never lazily
+// from an inbound packet. Phase 2 will additionally gate this on a
+// nonce armed by the control-plane FrameTypeForwardRegister handler;
+// Phase 1 keeps the behaviour permissive (first-write-wins on src) to
+// minimise wire churn while the data model is repositioned.
 func (p *Plane) register(allocID uint32, src netip.AddrPort) {
 	now := time.Now().UnixNano()
 	p.mu.Lock()
-	prev, existed := p.allocs[allocID]
-	var oldSrc netip.AddrPort
-	if existed {
-		// Re-registration from the same agent (or a new agent claiming
-		// the same id). Reuse the entry pointer so the lastSeen
-		// atomic isn't aliased between observers; rewrite src in-place
-		// and bump lastSeen.
-		oldSrc = prev.src
-		if oldSrc != src {
+	entry, existed := p.byAlloc[allocID]
+	if !existed {
+		p.mu.Unlock()
+		p.logger.Debug("forward: drop register (unknown alloc)",
+			"alloc_id", allocID, "src", src.String())
+		return
+	}
+	oldSrc := entry.src
+	wasNew := !oldSrc.IsValid()
+	if oldSrc != src {
+		if oldSrc.IsValid() {
 			delete(p.src2id, oldSrc)
 		}
-		prev.src = src
-		prev.lastSeen.Store(now)
-		p.src2id[src] = allocID
-	} else {
-		entry := &allocEntry{src: src}
-		entry.lastSeen.Store(now)
-		p.allocs[allocID] = entry
+		entry.src = src
 		p.src2id[src] = allocID
 	}
+	entry.lastSeen.Store(now)
+	uri := entry.uri
 	p.mu.Unlock()
-	if existed && oldSrc != src {
-		p.logger.Info("forward: allocation reclaimed",
-			"alloc_id", allocID, "old", oldSrc.String(), "new", src.String())
-	} else if !existed {
+	switch {
+	case wasNew:
 		p.logger.Debug("forward: allocation registered",
-			"alloc_id", allocID, "src", src.String())
+			"alloc_id", allocID, "uri", uri, "src", src.String())
+	case oldSrc != src:
+		p.logger.Info("forward: allocation reclaimed",
+			"alloc_id", allocID, "uri", uri,
+			"old", oldSrc.String(), "new", src.String())
 	}
 }
 

@@ -35,8 +35,8 @@ func TestGCOnceEvictsIdleAllocs(t *testing.T) {
 	p := newTestPlane(t)
 	p.idleTTL = 100 * time.Millisecond
 
-	idStale := p.Allocate()
-	idFresh := p.Allocate()
+	idStale := p.Allocate("outrelay://acme/agent/stale")
+	idFresh := p.Allocate("outrelay://acme/agent/fresh")
 	srcStale := netip.MustParseAddrPort("10.0.0.1:9001")
 	srcFresh := netip.MustParseAddrPort("10.0.0.2:9002")
 	p.register(idStale, srcStale)
@@ -44,7 +44,7 @@ func TestGCOnceEvictsIdleAllocs(t *testing.T) {
 
 	// Backdate the stale entry past the cutoff.
 	p.mu.RLock()
-	staleEntry := p.allocs[idStale]
+	staleEntry := p.byAlloc[idStale]
 	p.mu.RUnlock()
 	staleEntry.lastSeen.Store(time.Now().Add(-time.Second).UnixNano())
 
@@ -76,13 +76,13 @@ func TestRegisterBumpsLastSeen(t *testing.T) {
 	p := newTestPlane(t)
 	p.idleTTL = 100 * time.Millisecond
 
-	id := p.Allocate()
+	id := p.Allocate("outrelay://acme/agent/aaa")
 	src := netip.MustParseAddrPort("10.0.0.1:9001")
 	p.register(id, src)
 
 	// Backdate, then re-register — should bring lastSeen forward.
 	p.mu.RLock()
-	entry := p.allocs[id]
+	entry := p.byAlloc[id]
 	p.mu.RUnlock()
 	entry.lastSeen.Store(time.Now().Add(-time.Second).UnixNano())
 	p.register(id, src)
@@ -99,7 +99,7 @@ func TestRegisterReclaimsSrc2idOnSrcChange(t *testing.T) {
 	t.Parallel()
 	p := newTestPlane(t)
 
-	id := p.Allocate()
+	id := p.Allocate("outrelay://acme/agent/aaa")
 	srcOld := netip.MustParseAddrPort("10.0.0.1:9001")
 	srcNew := netip.MustParseAddrPort("10.0.0.1:9002")
 
