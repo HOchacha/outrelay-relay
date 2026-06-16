@@ -51,6 +51,48 @@ import (
 // still healthy will keep their entry warm.
 const DefaultAllocIdleTTL = 60 * time.Second
 
+// PunchNonceSize is the length of the random nonce an agent embeds in
+// both its control-plane FrameTypeForwardRegister and its UDP punch
+// packet. 16 bytes (2^128 space) is comfortably above what a foreign
+// src could brute-force inside the pending window.
+const PunchNonceSize = 16
+
+// DefaultPendingTTL is how long a control-plane ForwardRegister-armed
+// pending entry stays valid waiting for the matching UDP punch. Five
+// seconds covers control/UDP reordering and the worst-case NAT
+// pinhole-creation delay without leaving the slot guessable for long.
+const DefaultPendingTTL = 5 * time.Second
+
+// pendingEntry is the cert-URI + nonce binding installed by the
+// control-plane FrameTypeForwardRegister handler (edge.handleForwardRegister).
+// The UDP register loop consults it: a punch whose alloc_id has no
+// pending entry, or whose embedded nonce does not match, is dropped
+// without touching the live byAlloc table.
+type pendingEntry struct {
+	uri     string
+	nonce   [PunchNonceSize]byte
+	expires time.Time
+}
+
+// queuedPunch holds an arrived UDP punch whose ArmPending hasn't been
+// called yet — typical race between the control-plane ForwardRegister
+// (sub-ms processing) and the data-plane punch (sent immediately by
+// forward.Dial). Without this buffer the agent's punch loses the race
+// and the alloc never binds. Each entry has a short TTL; ArmPending
+// drains a queued punch immediately if the nonce matches.
+type queuedPunch struct {
+	src     netip.AddrPort
+	nonce   [PunchNonceSize]byte
+	expires time.Time
+}
+
+// ErrUnknownAlloc / ErrOwnerMismatch are returned by ArmPending so the
+// edge handler can map them to a precise ForwardRegisterReject reason.
+var (
+	ErrUnknownAlloc  = errors.New("forward: alloc not issued")
+	ErrOwnerMismatch = errors.New("forward: alloc owner mismatch")
+)
+
 // allocEntry records who owns an allocation, where it is registered, and
 // when it was last observed as alive. uri is the cert-verified URI of the
 // agent the allocation was issued to — owner identity is a first-class
@@ -70,7 +112,9 @@ type allocEntry struct {
 // issued. byAlloc is the forwarding-fast-path index; byURI lets the
 // caller release every alloc belonging to a disconnected agent in one
 // call (ForgetAgent). src2id is the reverse data-path index used to
-// bump lastSeen in O(1).
+// bump lastSeen in O(1). pending holds nonces armed by the control
+// plane (FrameTypeForwardRegister) that the UDP punch must match
+// before its src is bound to an alloc.
 type Plane struct {
 	udp    *net.UDPConn
 	logger *slog.Logger
@@ -79,9 +123,12 @@ type Plane struct {
 	byAlloc map[uint32]*allocEntry         // alloc_id -> entry
 	byURI   map[string]map[uint32]struct{} // agent URI -> set of allocs
 	src2id  map[netip.AddrPort]uint32      // reverse index: agent src -> alloc id
+	pending map[uint32]*pendingEntry       // alloc_id -> armed nonce + owner
+	queued  map[uint32]*queuedPunch        // alloc_id -> punch waiting for ArmPending
 
-	nextID  atomic.Uint32
-	idleTTL time.Duration // 0 disables the GC loop
+	nextID     atomic.Uint32
+	idleTTL    time.Duration // 0 disables the GC loop
+	pendingTTL time.Duration // 0 means use DefaultPendingTTL
 }
 
 // NewPlane binds a UDP socket at addr (e.g. "0.0.0.0:9443") and
@@ -100,12 +147,15 @@ func NewPlane(addr string, logger *slog.Logger) (*Plane, error) {
 		return nil, fmt.Errorf("forward: bind %s: %w", addr, err)
 	}
 	p := &Plane{
-		udp:     conn,
-		logger:  logger,
-		byAlloc: map[uint32]*allocEntry{},
-		byURI:   map[string]map[uint32]struct{}{},
-		src2id:  map[netip.AddrPort]uint32{},
-		idleTTL: DefaultAllocIdleTTL,
+		udp:        conn,
+		logger:     logger,
+		byAlloc:    map[uint32]*allocEntry{},
+		byURI:      map[string]map[uint32]struct{}{},
+		src2id:     map[netip.AddrPort]uint32{},
+		pending:    map[uint32]*pendingEntry{},
+		queued:     map[uint32]*queuedPunch{},
+		idleTTL:    DefaultAllocIdleTTL,
+		pendingTTL: DefaultPendingTTL,
 	}
 	// nextID starts at 1 (never assign 0 — reserved for the
 	// registration sentinel on the wire).
@@ -117,6 +167,78 @@ func NewPlane(addr string, logger *slog.Logger) (*Plane, error) {
 // disable the GC loop entirely (entries then live until explicit Forget
 // or process exit). Call before Run.
 func (p *Plane) SetIdleTTL(d time.Duration) { p.idleTTL = d }
+
+// SetPendingTTL overrides the default register-pending TTL (how long
+// an armed ForwardRegister stays valid waiting for the UDP punch).
+// Mostly for tests; production callers should use the default.
+func (p *Plane) SetPendingTTL(d time.Duration) { p.pendingTTL = d }
+
+// ArmPending installs a (uri, nonce) binding for allocID that the
+// matching UDP punch must satisfy before its src is bound to the
+// alloc. Called by edge.handleForwardRegister after it has verified
+// that ac.uri owns the alloc.
+//
+// Returns ErrUnknownAlloc if the alloc was never issued, or
+// ErrOwnerMismatch if it belongs to a different URI — either of those
+// the edge handler maps to a ForwardRegisterReject reason. Re-arming
+// the same alloc with a new nonce is permitted (it replaces the prior
+// pending entry; the previous nonce can no longer satisfy a punch).
+func (p *Plane) ArmPending(allocID uint32, uri string, nonce [PunchNonceSize]byte) error {
+	if uri == "" {
+		return ErrOwnerMismatch
+	}
+	ttl := p.pendingTTL
+	if ttl <= 0 {
+		ttl = DefaultPendingTTL
+	}
+	now := time.Now()
+	p.mu.Lock()
+	entry, ok := p.byAlloc[allocID]
+	if !ok {
+		p.mu.Unlock()
+		return ErrUnknownAlloc
+	}
+	if entry.uri != uri {
+		p.mu.Unlock()
+		return ErrOwnerMismatch
+	}
+	// If a punch arrived ahead of us (common race: agent sends ctrl
+	// frame and UDP punch back-to-back, UDP wins to the relay), drain
+	// it now if the nonce matches.
+	var (
+		drained    bool
+		drainedSrc netip.AddrPort
+	)
+	if q, queuedOK := p.queued[allocID]; queuedOK {
+		delete(p.queued, allocID)
+		if now.Before(q.expires) && q.nonce == nonce {
+			oldSrc := entry.src
+			if oldSrc != q.src {
+				if oldSrc.IsValid() {
+					delete(p.src2id, oldSrc)
+				}
+				entry.src = q.src
+				p.src2id[q.src] = allocID
+			}
+			entry.lastSeen.Store(now.UnixNano())
+			drained = true
+			drainedSrc = q.src
+		}
+	}
+	if !drained {
+		p.pending[allocID] = &pendingEntry{
+			uri:     uri,
+			nonce:   nonce,
+			expires: now.Add(ttl),
+		}
+	}
+	p.mu.Unlock()
+	if drained {
+		p.logger.Debug("forward: allocation registered (drained queued punch)",
+			"alloc_id", allocID, "uri", uri, "src", drainedSrc.String())
+	}
+	return nil
+}
 
 // Endpoint returns the UDP socket address the plane is bound to.
 // Use this to populate AllocGranted.forward_endpoint.
@@ -278,14 +400,19 @@ func (p *Plane) Run(ctx context.Context) error {
 		}
 		peerAlloc := binary.BigEndian.Uint32(buf[:4])
 		if peerAlloc == 0 {
-			// Registration: trailing payload is [my_alloc: u32 BE].
-			if n < 8 {
+			// Registration: [my_alloc: u32 BE] [nonce: PunchNonceSize bytes].
+			// The nonce must match what the agent claimed on its
+			// control-plane FrameTypeForwardRegister — see register().
+			if n < 8+PunchNonceSize {
 				p.logger.Warn("forward: invalid registration packet",
-					"src", srcAP.String(), "len", n)
+					"src", srcAP.String(), "len", n,
+					"want_len", 8+PunchNonceSize)
 				continue
 			}
 			myAlloc := binary.BigEndian.Uint32(buf[4:8])
-			p.register(myAlloc, srcAP)
+			var nonce [PunchNonceSize]byte
+			copy(nonce[:], buf[8:8+PunchNonceSize])
+			p.register(myAlloc, srcAP, nonce)
 			continue
 		}
 		// Data: forward to the registered endpoint, payload only.
@@ -359,22 +486,61 @@ func (p *Plane) gcOnce(now time.Time) {
 	}
 }
 
-// register binds an existing allocation's UDP src endpoint. The entry
-// must already exist — i.e. the relay must have called Allocate(uri)
-// before this packet arrived. A register packet for an unknown alloc is
-// silently dropped: under the URI-primary model, allocations are only
-// born through Allocate (which records the owning URI), never lazily
-// from an inbound packet. Phase 2 will additionally gate this on a
-// nonce armed by the control-plane FrameTypeForwardRegister handler;
-// Phase 1 keeps the behaviour permissive (first-write-wins on src) to
-// minimise wire churn while the data model is repositioned.
-func (p *Plane) register(allocID uint32, src netip.AddrPort) {
+// register binds an existing allocation's UDP src endpoint, but only
+// after verifying the punch's nonce matches the pending entry armed by
+// the control plane (edge.handleForwardRegister → ArmPending). A
+// register packet whose alloc has no pending entry, whose nonce
+// disagrees, or whose pending entry has already expired is dropped.
+//
+// Under the URI-primary model, this is the wire-level enforcement of
+// "the agent on the other end of the control mTLS connection is the
+// only one who can claim this alloc's UDP src": the nonce never leaves
+// that control stream in cleartext, so a spoofed punch cannot match
+// without first compromising the mTLS channel.
+func (p *Plane) register(allocID uint32, src netip.AddrPort, nonce [PunchNonceSize]byte) {
 	now := time.Now().UnixNano()
+	ttl := p.pendingTTL
+	if ttl <= 0 {
+		ttl = DefaultPendingTTL
+	}
 	p.mu.Lock()
+	pend, hasPending := p.pending[allocID]
+	if !hasPending {
+		// Punch arrived before ArmPending — queue it briefly so
+		// ArmPending can drain it on arrival (race between the agent's
+		// back-to-back ctrl ForwardRegister + UDP punch). Same TTL as
+		// pending; an unmatched punch is dropped on expiry.
+		p.queued[allocID] = &queuedPunch{
+			src:     src,
+			nonce:   nonce,
+			expires: time.Unix(0, now).Add(ttl),
+		}
+		p.mu.Unlock()
+		p.logger.Debug("forward: queueing register (no pending entry yet)",
+			"alloc_id", allocID, "src", src.String())
+		return
+	}
+	if time.Now().After(pend.expires) {
+		delete(p.pending, allocID)
+		p.mu.Unlock()
+		p.logger.Warn("forward: drop register (pending expired)",
+			"alloc_id", allocID, "src", src.String())
+		return
+	}
+	if pend.nonce != nonce {
+		p.mu.Unlock()
+		p.logger.Warn("forward: drop register (nonce mismatch)",
+			"alloc_id", allocID, "src", src.String())
+		return
+	}
 	entry, existed := p.byAlloc[allocID]
 	if !existed {
+		// The owning agent disconnected (ForgetAgent ran) between
+		// ArmPending and the punch arriving. Clean up the stale pending
+		// entry and drop.
+		delete(p.pending, allocID)
 		p.mu.Unlock()
-		p.logger.Debug("forward: drop register (unknown alloc)",
+		p.logger.Warn("forward: drop register (alloc forgotten before punch)",
 			"alloc_id", allocID, "src", src.String())
 		return
 	}
@@ -388,6 +554,7 @@ func (p *Plane) register(allocID uint32, src netip.AddrPort) {
 		p.src2id[src] = allocID
 	}
 	entry.lastSeen.Store(now)
+	delete(p.pending, allocID)
 	uri := entry.uri
 	p.mu.Unlock()
 	switch {

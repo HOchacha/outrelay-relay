@@ -12,6 +12,7 @@ package forward
 // drive it deterministically.
 
 import (
+	"errors"
 	"net/netip"
 	"sync/atomic"
 	"testing"
@@ -28,6 +29,31 @@ func newTestPlane(t *testing.T) *Plane {
 	return p
 }
 
+// armAndRegister is a test helper that mirrors the control-plane +
+// data-plane handshake the agent does for real: arm a pending entry
+// with a fresh nonce, then call register with the matching nonce.
+// Keeps the rest of the idle-TTL / src-rebind tests focused on
+// post-register behaviour without the Phase 2 nonce mechanics
+// cluttering every call site.
+func armAndRegister(t *testing.T, p *Plane, id uint32, uri string, src netip.AddrPort) {
+	t.Helper()
+	var nonce [PunchNonceSize]byte
+	// Vary the nonce per-call so re-arming doesn't accidentally reuse
+	// a stale entry's bytes. Distinct alloc + src + monotonic salt is
+	// enough — we're testing register, not the RNG.
+	nonce[0] = byte(id)
+	nonce[1] = byte(id >> 8)
+	nonce[2] = byte(id >> 16)
+	nonce[3] = byte(id >> 24)
+	nonce[4] = byte(src.Port())
+	nonce[5] = byte(src.Port() >> 8)
+	nonce[15] = byte(time.Now().UnixNano())
+	if err := p.ArmPending(id, uri, nonce); err != nil {
+		t.Fatalf("ArmPending(%d, %q): %v", id, uri, err)
+	}
+	p.register(id, src, nonce)
+}
+
 // TestGCOnceEvictsIdleAllocs — entries older than idleTTL are removed
 // from both allocs and src2id. Fresh entries are preserved.
 func TestGCOnceEvictsIdleAllocs(t *testing.T) {
@@ -39,8 +65,8 @@ func TestGCOnceEvictsIdleAllocs(t *testing.T) {
 	idFresh := p.Allocate("outrelay://acme/agent/fresh")
 	srcStale := netip.MustParseAddrPort("10.0.0.1:9001")
 	srcFresh := netip.MustParseAddrPort("10.0.0.2:9002")
-	p.register(idStale, srcStale)
-	p.register(idFresh, srcFresh)
+	armAndRegister(t, p, idStale, "outrelay://acme/agent/stale", srcStale)
+	armAndRegister(t, p, idFresh, "outrelay://acme/agent/fresh", srcFresh)
 
 	// Backdate the stale entry past the cutoff.
 	p.mu.RLock()
@@ -78,14 +104,14 @@ func TestRegisterBumpsLastSeen(t *testing.T) {
 
 	id := p.Allocate("outrelay://acme/agent/aaa")
 	src := netip.MustParseAddrPort("10.0.0.1:9001")
-	p.register(id, src)
+	armAndRegister(t, p, id, "outrelay://acme/agent/aaa", src)
 
 	// Backdate, then re-register — should bring lastSeen forward.
 	p.mu.RLock()
 	entry := p.byAlloc[id]
 	p.mu.RUnlock()
 	entry.lastSeen.Store(time.Now().Add(-time.Second).UnixNano())
-	p.register(id, src)
+	armAndRegister(t, p, id, "outrelay://acme/agent/aaa", src)
 
 	p.gcOnce(time.Now())
 	if _, ok := p.Lookup(id); !ok {
@@ -103,8 +129,8 @@ func TestRegisterReclaimsSrc2idOnSrcChange(t *testing.T) {
 	srcOld := netip.MustParseAddrPort("10.0.0.1:9001")
 	srcNew := netip.MustParseAddrPort("10.0.0.1:9002")
 
-	p.register(id, srcOld)
-	p.register(id, srcNew)
+	armAndRegister(t, p, id, "outrelay://acme/agent/aaa", srcOld)
+	armAndRegister(t, p, id, "outrelay://acme/agent/aaa", srcNew)
 
 	p.mu.RLock()
 	_, oldStillThere := p.src2id[srcOld]
@@ -116,6 +142,93 @@ func TestRegisterReclaimsSrc2idOnSrcChange(t *testing.T) {
 	}
 	if !newRegistered || newID != id {
 		t.Fatalf("new src must map to id=%d, got id=%d ok=%v", id, newID, newRegistered)
+	}
+}
+
+// TestArmPendingUnknownAlloc — ArmPending on an alloc that was never
+// issued must surface ErrUnknownAlloc so edge.handleForwardRegister
+// can map it to a ForwardRegisterReject{reason:"unknown_alloc"}.
+func TestArmPendingUnknownAlloc(t *testing.T) {
+	t.Parallel()
+	p := newTestPlane(t)
+	var nonce [PunchNonceSize]byte
+	if err := p.ArmPending(0xDEAD, "outrelay://acme/agent/a", nonce); err == nil {
+		t.Fatal("ArmPending on unknown alloc should fail")
+	} else if !errors.Is(err, ErrUnknownAlloc) {
+		t.Fatalf("got %v, want ErrUnknownAlloc", err)
+	}
+}
+
+// TestArmPendingOwnerMismatch — ArmPending with a URI that doesn't
+// match the alloc's owner must surface ErrOwnerMismatch. This is the
+// wire-level enforcement of "the agent on the other end of the mTLS
+// control connection is the only one who can claim this alloc".
+func TestArmPendingOwnerMismatch(t *testing.T) {
+	t.Parallel()
+	p := newTestPlane(t)
+	id := p.Allocate("outrelay://acme/agent/owner")
+	var nonce [PunchNonceSize]byte
+	err := p.ArmPending(id, "outrelay://acme/agent/imposter", nonce)
+	if !errors.Is(err, ErrOwnerMismatch) {
+		t.Fatalf("got %v, want ErrOwnerMismatch", err)
+	}
+	// And the alloc must still be empty — nothing was bound.
+	if entry, ok := p.byAlloc[id]; ok && entry.src.IsValid() {
+		t.Fatalf("alloc src bound on owner mismatch: %v", entry.src)
+	}
+}
+
+// TestRegisterRejectsNonceMismatch — a punch whose nonce disagrees
+// with the armed pending entry is dropped, leaving the alloc unbound.
+func TestRegisterRejectsNonceMismatch(t *testing.T) {
+	t.Parallel()
+	p := newTestPlane(t)
+	uri := "outrelay://acme/agent/a"
+	id := p.Allocate(uri)
+	armed := [PunchNonceSize]byte{0xAA}
+	wrong := [PunchNonceSize]byte{0xBB}
+	if err := p.ArmPending(id, uri, armed); err != nil {
+		t.Fatalf("ArmPending: %v", err)
+	}
+	src := netip.MustParseAddrPort("10.0.0.1:9001")
+	p.register(id, src, wrong)
+	if got, ok := p.Lookup(id); ok && got == src {
+		t.Fatal("alloc bound despite nonce mismatch")
+	}
+}
+
+// TestRegisterDrainsQueuedPunch — when the UDP punch races ahead of
+// the control-plane ArmPending, the punch is queued; the subsequent
+// ArmPending must drain it and bind the src in one shot. This is the
+// fast path the e2e test depends on.
+func TestRegisterDrainsQueuedPunch(t *testing.T) {
+	t.Parallel()
+	p := newTestPlane(t)
+	uri := "outrelay://acme/agent/a"
+	id := p.Allocate(uri)
+	nonce := [PunchNonceSize]byte{0xCD}
+	src := netip.MustParseAddrPort("10.0.0.1:9001")
+
+	// Punch arrives first — queued, alloc still unbound.
+	p.register(id, src, nonce)
+	if _, ok := p.Lookup(id); ok {
+		// Lookup returns the src even when zero-valued — fine, but
+		// the entry's src must not equal the punch's src yet.
+		p.mu.RLock()
+		bound := p.byAlloc[id].src
+		p.mu.RUnlock()
+		if bound == src {
+			t.Fatal("alloc bound before ArmPending — queued path bypassed")
+		}
+	}
+
+	// ArmPending arrives — should drain the queued punch and bind.
+	if err := p.ArmPending(id, uri, nonce); err != nil {
+		t.Fatalf("ArmPending: %v", err)
+	}
+	got, ok := p.Lookup(id)
+	if !ok || got != src {
+		t.Fatalf("Lookup after drain = (%v, %v), want (%v, true)", got, ok, src)
 	}
 }
 

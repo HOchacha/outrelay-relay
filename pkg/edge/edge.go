@@ -363,6 +363,8 @@ func (s *Server) controlLoop(ctx context.Context, ac *AgentConn, ctrl transport.
 			s.handleMigrateToP2P(ac, f)
 		case orp.FrameTypeForwardResume:
 			s.handleForwardResume(ac, f)
+		case orp.FrameTypeForwardRegister:
+			s.handleForwardRegister(ac, f)
 		default:
 			s.logger.Warn("unexpected control frame", "type", f.Type, "from", ac.uri)
 		}
@@ -1061,6 +1063,68 @@ func (s *Server) handleMigrateToP2P(ac *AgentConn, f *orp.Frame) {
 // been in forward mode in the first place. Log and drop.
 //
 // Phase 2 of forward-mode recovery; see hocha-work/forward-resume-flow.md.
+// handleForwardRegister processes the agent's control-plane half of
+// the forward-mode registration handshake. The cert URI on this
+// connection (ac.uri) must own the alloc — the plane's URI-primary
+// model is what makes this check authoritative. On success an entry
+// is armed in forward.Plane.pending, and the matching UDP punch is
+// what actually binds the alloc to a UDP src.
+//
+// On rejection the relay sends FrameTypeForwardRegisterReject with a
+// stable short reason so the agent can map it back to a user-visible
+// error and abandon the stream cleanly. Reject is best-effort — if
+// the write itself fails the agent's UDP punch will simply never
+// match, which is the same observable outcome.
+func (s *Server) handleForwardRegister(ac *AgentConn, f *orp.Frame) {
+	m := &orpv1.ForwardRegister{}
+	if err := orp.UnmarshalProto(f, orp.FrameTypeForwardRegister, m); err != nil {
+		s.logger.Warn("edge: FORWARD_REGISTER unmarshal failed",
+			"from", ac.uri, "err", err)
+		return
+	}
+	if s.forward == nil {
+		s.logger.Warn("edge: FORWARD_REGISTER received but forward plane disabled",
+			"from", ac.uri, "alloc_id", m.AllocId)
+		s.replyForwardRegisterReject(ac, m.AllocId, "forward_plane_disabled")
+		return
+	}
+	if len(m.PunchNonce) != forward.PunchNonceSize {
+		s.logger.Warn("edge: FORWARD_REGISTER bad nonce length",
+			"from", ac.uri, "alloc_id", m.AllocId, "len", len(m.PunchNonce))
+		s.replyForwardRegisterReject(ac, m.AllocId, "bad_nonce")
+		return
+	}
+	var nonce [forward.PunchNonceSize]byte
+	copy(nonce[:], m.PunchNonce)
+	switch err := s.forward.ArmPending(m.AllocId, ac.uri, nonce); {
+	case errors.Is(err, forward.ErrUnknownAlloc):
+		s.logger.Warn("edge: FORWARD_REGISTER for unknown alloc",
+			"from", ac.uri, "alloc_id", m.AllocId)
+		s.replyForwardRegisterReject(ac, m.AllocId, "unknown_alloc")
+	case errors.Is(err, forward.ErrOwnerMismatch):
+		s.logger.Warn("edge: FORWARD_REGISTER owner mismatch",
+			"from", ac.uri, "alloc_id", m.AllocId)
+		s.replyForwardRegisterReject(ac, m.AllocId, "owner_mismatch")
+	case err != nil:
+		s.logger.Warn("edge: FORWARD_REGISTER unexpected error",
+			"from", ac.uri, "alloc_id", m.AllocId, "err", err)
+		s.replyForwardRegisterReject(ac, m.AllocId, "internal_error")
+	default:
+		s.logger.Info("edge: FORWARD_REGISTER armed",
+			"from", ac.uri, "alloc_id", m.AllocId)
+	}
+}
+
+func (s *Server) replyForwardRegisterReject(ac *AgentConn, allocID uint32, reason string) {
+	if err := ac.WriteCtrl(orp.FrameTypeForwardRegisterReject, &orpv1.ForwardRegisterReject{
+		AllocId: allocID,
+		Reason:  reason,
+	}); err != nil {
+		s.logger.Warn("edge: FORWARD_REGISTER reject write failed",
+			"uri", ac.uri, "alloc_id", allocID, "reason", reason, "err", err)
+	}
+}
+
 func (s *Server) handleForwardResume(ac *AgentConn, f *orp.Frame) {
 	m := &orpv1.ForwardResume{}
 	if err := orp.UnmarshalProto(f, orp.FrameTypeForwardResume, m); err != nil {

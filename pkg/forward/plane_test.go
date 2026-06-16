@@ -35,8 +35,22 @@ func TestPlaneForwarding(t *testing.T) {
 
 	// Two pre-allocated ids (the relay would normally hand these
 	// out via AllocGranted to the consumer / provider agents).
-	allocA := plane.Allocate("outrelay://acme/agent/aaa")
-	allocB := plane.Allocate("outrelay://acme/agent/bbb")
+	uriA := "outrelay://acme/agent/aaa"
+	uriB := "outrelay://acme/agent/bbb"
+	allocA := plane.Allocate(uriA)
+	allocB := plane.Allocate(uriB)
+
+	// Arm the pending entries the way edge.handleForwardRegister
+	// would after receiving the agents' control-plane ForwardRegister.
+	var nonceA, nonceB [forward.PunchNonceSize]byte
+	nonceA[0] = 0xAA
+	nonceB[0] = 0xBB
+	if err := plane.ArmPending(allocA, uriA, nonceA); err != nil {
+		t.Fatalf("ArmPending A: %v", err)
+	}
+	if err := plane.ArmPending(allocB, uriB, nonceB); err != nil {
+		t.Fatalf("ArmPending B: %v", err)
+	}
 	if allocA == 0 || allocB == 0 || allocA == allocB {
 		t.Fatalf("bad alloc ids: A=%d B=%d", allocA, allocB)
 	}
@@ -54,18 +68,20 @@ func TestPlaneForwarding(t *testing.T) {
 	defer connB.Close()
 
 	// Register both with the plane: prefix=0 (registration) +
-	// payload=[my_alloc].
-	register := func(c *net.UDPConn, alloc uint32) {
+	// payload=[my_alloc][nonce]. The nonce must match what was armed
+	// above; otherwise the punch is dropped.
+	register := func(c *net.UDPConn, alloc uint32, nonce [forward.PunchNonceSize]byte) {
 		t.Helper()
-		buf := make([]byte, 8)
+		buf := make([]byte, 8+forward.PunchNonceSize)
 		binary.BigEndian.PutUint32(buf[0:4], 0)
 		binary.BigEndian.PutUint32(buf[4:8], alloc)
+		copy(buf[8:], nonce[:])
 		if _, err := c.WriteTo(buf, net.UDPAddrFromAddrPort(relayAddr)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	register(connA, allocA)
-	register(connB, allocB)
+	register(connA, allocA, nonceA)
+	register(connB, allocB, nonceB)
 
 	// Wait for the plane's registration goroutine to record both.
 	// It's an async UDP read so we need to give it a beat.
