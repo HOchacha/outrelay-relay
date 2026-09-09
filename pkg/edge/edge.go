@@ -16,7 +16,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
+	"slices"
 	"strconv"
 	"sync"
 	"time"
@@ -70,6 +72,129 @@ type Server struct {
 	// allocation grant. Phase 2 of forward-mode recovery — see
 	// hocha-work/forward-resume-flow.md.
 	forwardResumer *forwardMatcher
+
+	// successorsMu guards successors: the ordered list of peer relay
+	// endpoints agents should fall back to if this relay dies. Handed
+	// out in HELLO_ACK and per stream (INCOMING_STREAM / STREAM_READY /
+	// ALLOC_GRANTED) so both halves of every stream hold an identical
+	// list before any byte flows — the relocation invariant.
+	successorsMu sync.RWMutex
+	successors   []string
+
+	// agentsMu guards agents: every live AgentConn, so Drain can
+	// reach each agent's ctrl. serveConn adds on HELLO_ACK and
+	// removes on exit.
+	agentsMu sync.Mutex
+	agents   map[*AgentConn]struct{}
+}
+
+func (s *Server) trackAgent(ac *AgentConn) {
+	s.agentsMu.Lock()
+	defer s.agentsMu.Unlock()
+	if s.agents == nil {
+		s.agents = map[*AgentConn]struct{}{}
+	}
+	s.agents[ac] = struct{}{}
+}
+
+func (s *Server) untrackAgent(ac *AgentConn) {
+	s.agentsMu.Lock()
+	defer s.agentsMu.Unlock()
+	delete(s.agents, ac)
+}
+
+// AgentCount reports how many agent links are currently attached.
+// Operators read it (via /debug/metrics-style probes) to confirm a
+// drain has actually emptied the relay before taking it down.
+func (s *Server) AgentCount() int {
+	s.agentsMu.Lock()
+	defer s.agentsMu.Unlock()
+	return len(s.agents)
+}
+
+func (s *Server) liveAgents() []*AgentConn {
+	s.agentsMu.Lock()
+	defer s.agentsMu.Unlock()
+	out := make([]*AgentConn, 0, len(s.agents))
+	for ac := range s.agents {
+		out = append(out, ac)
+	}
+	return out
+}
+
+// Drain initiates a planned relocation of every agent on this relay:
+// one GOAWAY per live agent naming targets (or, when targets is
+// empty, the relay's current successor list), then a wait of
+// deadline for agents to leave on their own, then a forced close of
+// whatever links remain so a stuck agent falls back to the ordinary
+// crash-recovery path instead of pinning the relay open. Returns
+// when every link is closed or ctx is done.
+//
+// Because both halves of every stream on this relay receive the same
+// targets, they meet on the same successor and STREAM_RESUME pairs
+// them there — the relay-local resume matcher is not a problem for a
+// planned move.
+func (s *Server) Drain(ctx context.Context, targets []string, reason string, deadline time.Duration) {
+	if len(targets) == 0 {
+		targets = s.Successors()
+	}
+	agents := s.liveAgents()
+	s.logger.Info("edge: draining", "agents", len(agents), "targets", targets,
+		"reason", reason, "deadline", deadline)
+	goaway := &orpv1.Goaway{
+		TargetEndpoints: targets,
+		Reason:          reason,
+		DeadlineMs:      uint32(min(deadline.Milliseconds(), math.MaxUint32)), // #nosec G115 -- clamped
+	}
+	for _, ac := range agents {
+		if err := ac.WriteCtrl(orp.FrameTypeGoaway, goaway); err != nil {
+			s.logger.Warn("edge: GOAWAY write failed; closing link", "uri", ac.uri, "err", err)
+			_ = ac.conn.Close()
+		}
+	}
+
+	// Wait for agents to leave, polling the live set; give up at the
+	// deadline and close the stragglers.
+	poll := time.NewTicker(20 * time.Millisecond)
+	defer poll.Stop()
+	timeout := time.NewTimer(deadline)
+	defer timeout.Stop()
+	for {
+		remaining := s.liveAgents()
+		if len(remaining) == 0 {
+			s.logger.Info("edge: drain complete; all agents relocated")
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-timeout.C:
+			s.logger.Warn("edge: drain deadline reached; closing remaining links",
+				"remaining", len(remaining))
+			for _, ac := range remaining {
+				_ = ac.conn.Close()
+			}
+			return
+		case <-poll.C:
+		}
+	}
+}
+
+// SetSuccessors replaces the successor list advertised to agents from
+// now on. The relay's fleet-refresh loop calls this whenever the
+// controller's fleet snapshot changes; tests call it directly. Streams
+// already open keep the list they were given.
+func (s *Server) SetSuccessors(endpoints []string) {
+	s.successorsMu.Lock()
+	defer s.successorsMu.Unlock()
+	s.successors = slices.Clone(endpoints)
+}
+
+// Successors returns a copy of the currently advertised successor list.
+func (s *Server) Successors() []string {
+	s.successorsMu.RLock()
+	defer s.successorsMu.RUnlock()
+	return slices.Clone(s.successors)
 }
 
 type streamPair struct {
@@ -289,15 +414,19 @@ func (s *Server) serveConn(ctx context.Context, conn transport.Conn) {
 		s.logger.Warn("HELLO uri mismatch", "cert_uri", uri, "claimed_uri", hello.AgentUri)
 		return
 	}
-	if err := orp.WriteFrame(ctrl, orp.FrameTypeHelloAck, &orpv1.HelloAck{}); err != nil {
+	if err := orp.WriteFrame(ctrl, orp.FrameTypeHelloAck, &orpv1.HelloAck{
+		SuccessorEndpoints: s.Successors(),
+	}); err != nil {
 		s.logger.Warn("write HELLO_ACK", "uri", uri, "err", err)
 		return
 	}
 
-	ac := &AgentConn{conn: conn, uri: uri, ctrl: ctrl}
+	ac := &AgentConn{conn: conn, uri: uri, ctrl: ctrl, successors: s.Successors}
 	s.reg.RegisterAgent(uri, ac)
+	s.trackAgent(ac)
 	s.logger.Info("agent connected", "uri", uri)
 	defer func() {
+		s.untrackAgent(ac)
 		s.reg.UnregisterAgent(ctx, uri)
 		// S1: drop every forward allocation owned by this agent the
 		// moment its control connection goes away, instead of waiting
@@ -607,11 +736,13 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 			"stream_id", open.StreamId, "caller", caller.uri, "provider", prov.AgentURI(),
 			"consumer_alloc", consumerAlloc, "provider_alloc", providerAlloc,
 			"endpoint", fwdEndpoint)
+		resumeRelays := s.Successors()
 		if err := caller.WriteCtrl(orp.FrameTypeAllocGranted, &orpv1.AllocGranted{
 			StreamId:        open.StreamId,
 			MyAllocation:    consumerAlloc,
 			PeerAllocation:  providerAlloc,
 			ForwardEndpoint: fwdEndpoint,
+			ResumeRelays:    resumeRelays,
 		}); err != nil {
 			s.logger.Warn("edge: AllocGranted write to consumer failed",
 				"stream_id", open.StreamId, "caller", caller.uri, "err", err)
@@ -622,6 +753,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 			MyAllocation:    providerAlloc,
 			PeerAllocation:  consumerAlloc,
 			ForwardEndpoint: fwdEndpoint,
+			ResumeRelays:    resumeRelays,
 		}); err != nil {
 			s.logger.Warn("edge: AllocGranted write to provider failed",
 				"stream_id", open.StreamId, "provider", prov.AgentURI(), "err", err)
@@ -648,9 +780,10 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	// (synthetic registry entries in tests); the smoke and prod
 	// paths always have one.
 	provAC, _ := s.reg.LookupAgent(prov.AgentURI()).(*AgentConn)
-	_ = caller.WriteCtrl(orp.FrameTypeStreamReady, &orpv1.StreamReady{StreamId: open.StreamId})
+	ready := &orpv1.StreamReady{StreamId: open.StreamId, ResumeRelays: s.Successors()}
+	_ = caller.WriteCtrl(orp.FrameTypeStreamReady, ready)
 	if provAC != nil {
-		_ = provAC.WriteCtrl(orp.FrameTypeStreamReady, &orpv1.StreamReady{StreamId: open.StreamId})
+		_ = provAC.WriteCtrl(orp.FrameTypeStreamReady, ready)
 	}
 
 	n, _ := splice.Bidirectional(consumerStream, provStream)
@@ -672,6 +805,11 @@ type AgentConn struct {
 	// goroutine sees this AgentConn.
 	ctrl   transport.Stream
 	ctrlMu sync.Mutex
+
+	// successors yields the relay's current successor list so
+	// OpenIncoming can stamp resume_relays on INCOMING_STREAM. nil in
+	// tests that construct AgentConn without a Server.
+	successors func() []string
 }
 
 func (a *AgentConn) AgentURI() string { return a.uri }
@@ -698,11 +836,16 @@ func (a *AgentConn) OpenIncoming(service, method, caller string, streamID uint64
 	if err != nil {
 		return nil, err
 	}
+	var resumeRelays []string
+	if a.successors != nil {
+		resumeRelays = a.successors()
+	}
 	err = orp.WriteFrame(s, orp.FrameTypeIncomingStream, &orpv1.IncomingStream{
 		TargetService:  service,
 		Method:         method,
 		SourceAgentUri: caller,
 		StreamId:       streamID,
+		ResumeRelays:   resumeRelays,
 	})
 	if err != nil {
 		_ = s.Close()
@@ -1190,11 +1333,13 @@ func (s *Server) driveForwardResume(self *halfForwardResume) {
 		"self_uri", self.agentURI, "self_alloc", selfAlloc,
 		"peer_uri", peer.agentURI, "peer_alloc", peerAlloc)
 
+	resumeRelays := s.Successors()
 	if err := self.ac.WriteCtrl(orp.FrameTypeAllocGranted, &orpv1.AllocGranted{
 		StreamId:        streamID,
 		MyAllocation:    selfAlloc,
 		PeerAllocation:  peerAlloc,
 		ForwardEndpoint: fwdEndpoint,
+		ResumeRelays:    resumeRelays,
 	}); err != nil {
 		s.logger.Warn("edge: FORWARD_RESUME write to self failed",
 			"stream_id", streamID, "uri", self.agentURI, "err", err)
@@ -1206,6 +1351,7 @@ func (s *Server) driveForwardResume(self *halfForwardResume) {
 		MyAllocation:    peerAlloc,
 		PeerAllocation:  selfAlloc,
 		ForwardEndpoint: fwdEndpoint,
+		ResumeRelays:    resumeRelays,
 	}); err != nil {
 		s.logger.Warn("edge: FORWARD_RESUME write to peer failed",
 			"stream_id", streamID, "uri", peer.agentURI, "err", err)

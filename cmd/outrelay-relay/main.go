@@ -16,8 +16,10 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,7 +37,7 @@ import (
 	"github.com/boanlab/outrelay-relay/pkg/edge"
 	"github.com/boanlab/outrelay-relay/pkg/intra"
 	"github.com/boanlab/outrelay-relay/pkg/policy"
-	"github.com/boanlab/outrelay-relay/pkg/registry"
+	relayreg "github.com/boanlab/outrelay-relay/pkg/registry"
 )
 
 // Version is stamped at link time via -ldflags '-X main.Version=...'.
@@ -54,6 +56,10 @@ func main() {
 		relayID         = flag.String("relay-id", "", "this relay's id (advertised via UpsertRelay; defaults to listen addr)")
 		region          = flag.String("region", "local", "this relay's region label")
 		advertised      = flag.String("advertise", "", "endpoint advertised to agents (defaults to --listen)")
+		heartbeat       = flag.Duration("heartbeat", relayreg.DefaultHeartbeatPeriod, "how often to re-register with the controller and refresh the successor relay list handed to agents")
+		drainOnSignal   = flag.Bool("drain-on-signal", true, "on SIGTERM/SIGINT send GOAWAY to every agent and wait up to --drain-timeout for them to relocate before exiting; a second signal exits immediately")
+		drainTo         = flag.String("drain-to", "", "comma-separated relay endpoints named in GOAWAY (default: the successor list learned from the controller)")
+		drainTimeout    = flag.Duration("drain-timeout", 10*time.Second, "how long agents get to relocate after GOAWAY before their links are closed")
 		policyTenant    = flag.String("tenant", "", "tenant whose policies to subscribe to (empty = no policy enforcement)")
 		debugListen     = flag.String("debug-listen", "127.0.0.1:9100", "localhost-only debug HTTP (/debug/metrics, /debug/pprof). Empty disables.")
 		metricsDump     = flag.String("metrics-dump", "", "JSONL file path for periodic metrics dump (empty disables)")
@@ -80,8 +86,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	ctx, cancel := signalContext()
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	sigC := make(chan os.Signal, 1)
+	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
 
 	ctrlCreds, err := controllerCreds(*controllerTLS, tlsConf)
 	if err != nil {
@@ -114,17 +122,18 @@ func main() {
 	}
 
 	upsertCtx, upsertCancel := context.WithTimeout(ctx, 5*time.Second)
-	if _, err := ctrl.UpsertRelay(upsertCtx, &pb.UpsertRelayRequest{
+	first, err := ctrl.UpsertRelay(upsertCtx, &pb.UpsertRelayRequest{
 		Id: id, Region: *region, Endpoint: advert,
-	}); err != nil {
-		upsertCancel()
+	})
+	upsertCancel()
+	if err != nil {
 		logger.Error("upsert relay", "err", err)
 		os.Exit(1)
 	}
-	upsertCancel()
-	logger.Info("relay self-registered", "id", id, "controller", *controllerAddr, "version", Version)
+	logger.Info("relay self-registered", "id", id, "controller", *controllerAddr,
+		"version", Version, "fleet", len(first.Relays))
 
-	reg := registry.New(ctrl, id, *region, logger)
+	reg := relayreg.New(ctrl, id, *region, logger)
 
 	var (
 		policyEngine *policy.Engine
@@ -149,13 +158,6 @@ func main() {
 
 	// Observability — shared registry, optional debug HTTP and JSONL dump.
 	obsReg := observe.NewRegistry()
-	if *debugListen != "" {
-		go func() {
-			if err := observe.ServeDebug(ctx, *debugListen, obsReg); err != nil {
-				logger.Warn("debug http", "err", err)
-			}
-		}()
-	}
 	if *metricsDump != "" {
 		go func() {
 			if err := observe.NewDumper(obsReg, *metricsDump, *metricsInterval).Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -190,6 +192,57 @@ func main() {
 	}
 
 	srv := edge.New(*listen, tlsConf, reg, policyEngine, policyCache, auditEm, pool, forwardPlane, obsReg, logger)
+
+	// Successor list: seeded from the startup snapshot, then refreshed
+	// by the heartbeat so agents always hold a current fallback list
+	// (HELLO_ACK.successor_endpoints / per-stream resume_relays).
+	srv.SetSuccessors(relayreg.Successors(id, *region, first.Relays))
+	hb := relayreg.NewHeartbeat(ctrl, id, *region, advert, *heartbeat, logger)
+	hb.OnSuccessors(srv.SetSuccessors)
+	go hb.Run(ctx)
+
+	// Planned relocation (GOAWAY) — two operator entry points sharing
+	// the same defaults: SIGTERM (k8s pod termination, rolling
+	// upgrade) and POST /debug/drain on the localhost debug port
+	// (manual rebalance / preempt).
+	drainDefaults := edge.DrainDefaults{
+		Targets:  splitEndpoints(*drainTo),
+		Reason:   "drain",
+		Deadline: *drainTimeout,
+	}
+	if *debugListen != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/", observe.DebugMux(obsReg))
+		mux.Handle("/debug/drain", edge.DrainHandler(drainDefaults,
+			func(targets []string, reason string, deadline time.Duration) {
+				go srv.Drain(ctx, targets, reason, deadline)
+			}, logger))
+		go func() {
+			if err := observe.ServeDebugHandler(ctx, *debugListen, mux); err != nil {
+				logger.Warn("debug http", "err", err)
+			}
+		}()
+	}
+	go func() {
+		<-sigC
+		if !*drainOnSignal {
+			cancel()
+			return
+		}
+		logger.Info("signal received; draining agents before exit",
+			"targets", drainDefaults.Targets, "timeout", drainDefaults.Deadline)
+		done := make(chan struct{})
+		go func() {
+			srv.Drain(ctx, drainDefaults.Targets, drainDefaults.Reason, drainDefaults.Deadline)
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-sigC:
+			logger.Warn("second signal; exiting without waiting for drain")
+		}
+		cancel()
+	}()
 
 	// Optional TCP+TLS fallback listener for environments that block
 	// UDP. Same Server, same handlers — yamux multiplexes streams
@@ -334,13 +387,14 @@ func parseLogLevel(s string) slog.Level {
 	}
 }
 
-func signalContext() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
-	sigC := make(chan os.Signal, 1)
-	signal.Notify(sigC, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigC
-		cancel()
-	}()
-	return ctx, cancel
+// splitEndpoints parses a comma-separated host:port list, dropping
+// empty items. Empty input yields nil (= "use advertised successors").
+func splitEndpoints(raw string) []string {
+	var out []string
+	for _, ep := range strings.Split(raw, ",") {
+		if ep = strings.TrimSpace(ep); ep != "" {
+			out = append(out, ep)
+		}
+	}
+	return out
 }
