@@ -94,3 +94,26 @@ func waitMatch(t *testing.T, ch <-chan *halfStream, d time.Duration) *halfStream
 		return nil
 	}
 }
+
+// TestResumeMatcherDesignatesOneSplicer — exactly one of the two
+// matched halves must own the splice. Both handleResumeHalf
+// goroutines wake up on match; if both ran splice.Bidirectional the
+// pair would have two concurrent readers per stream and bytes would
+// be reordered under load (seen as a checksum mismatch on the
+// CloudStack drain run).
+func TestResumeMatcherDesignatesOneSplicer(t *testing.T) {
+	t.Parallel()
+	m := newResumeMatcher()
+	id := resume.StreamID(0xfeed)
+
+	a := &halfStream{id: id}
+	b := &halfStream{id: id}
+	chA := m.Submit(a)
+	chB := m.Submit(b)
+	waitMatch(t, chA, time.Second)
+	waitMatch(t, chB, time.Second)
+
+	if a.splicer == b.splicer {
+		t.Fatalf("splicer flags: a=%v b=%v, want exactly one true", a.splicer, b.splicer)
+	}
+}

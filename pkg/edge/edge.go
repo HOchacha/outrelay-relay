@@ -288,6 +288,20 @@ func (s *Server) recordPair(streamID uint64, p streamPair) bool {
 	return true
 }
 
+// replacePair is recordPair for the resume / migrate-back paths: the
+// stream already existed on some relay, so a stale mapping under the
+// same id is superseded rather than treated as a collision. The two
+// halves arrive without role information; peerOf is symmetric, so
+// which URI lands in which slot does not matter.
+func (s *Server) replacePair(streamID uint64, p streamPair) {
+	if streamID == 0 {
+		return
+	}
+	s.pairsMu.Lock()
+	s.pairs[streamID] = p
+	s.pairsMu.Unlock()
+}
+
 func (s *Server) forgetPair(streamID uint64) {
 	if streamID == 0 {
 		return
@@ -545,7 +559,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	// A fresh stream may carry STREAM_RESUME instead of OPEN_STREAM
 	// when an agent is reconnecting after a relay failure.
 	if f.Type == orp.FrameTypeStreamResume {
-		s.handleResumeHalf(ctx, consumerStream, f)
+		s.handleResumeHalf(ctx, caller.uri, consumerStream, f)
 		return
 	}
 	// MIGRATE_TO_RELAY arrives on a fresh stream when an agent is
@@ -553,7 +567,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	// logic is identical to STREAM_RESUME — re-use the matcher so
 	// both halves splice once they arrive.
 	if f.Type == orp.FrameTypeMigrateToRelay {
-		s.handleMigrateToRelay(consumerStream, f)
+		s.handleMigrateToRelay(caller.uri, consumerStream, f)
 		return
 	}
 	if f.Type != orp.FrameTypeOpenStream {
@@ -1361,7 +1375,7 @@ func (s *Server) driveForwardResume(self *halfForwardResume) {
 // handleMigrateToRelay re-uses the resumeMatcher to re-pair the two
 // halves and splice. If the migrated LRU has prior metadata for the
 // stream, we annotate the log and discard the entry on success.
-func (s *Server) handleMigrateToRelay(st transport.Stream, f *orp.Frame) {
+func (s *Server) handleMigrateToRelay(callerURI string, st transport.Stream, f *orp.Frame) {
 	m := &orpv1.MigrateToRelay{}
 	if err := orp.UnmarshalProto(f, orp.FrameTypeMigrateToRelay, m); err != nil {
 		s.logger.Warn("edge: MIGRATE_TO_RELAY unmarshal failed", "err", err)
@@ -1381,6 +1395,7 @@ func (s *Server) handleMigrateToRelay(st transport.Stream, f *orp.Frame) {
 	half := &halfStream{
 		id:         id,
 		stream:     st,
+		uri:        callerURI,
 		myPos:      int64(m.MyPosition),      // #nosec G115 -- byte count, fits in int64
 		peerAckPos: int64(m.PeerAckPosition), // #nosec G115 -- byte count, fits in int64
 	}
@@ -1392,12 +1407,26 @@ func (s *Server) handleMigrateToRelay(st transport.Stream, f *orp.Frame) {
 	if prior != nil {
 		s.migrated.Discard(id)
 	}
-	n, _ := splice.Bidirectional(st, matched.stream)
+	if !half.splicer {
+		<-half.done
+		return
+	}
+	s.splicePair(half, matched)
+}
+
+// splicePair runs the splice for a matched (resume / migrate-back)
+// pair from the splicer half's goroutine. It owns both streams until
+// the splice ends and then releases the parked peer goroutine.
+func (s *Server) splicePair(self, peer *halfStream) {
+	defer close(peer.done)
+	s.replacePair(uint64(self.id), streamPair{consumerURI: self.uri, providerURI: peer.uri})
+	defer s.forgetPair(uint64(self.id))
+	n, _ := splice.Bidirectional(self.stream, peer.stream)
 	if s.metrics != nil {
 		s.metrics.bytesForwarded.Add(n)
 	}
-	_ = st.Close()
-	_ = matched.stream.Close()
+	_ = self.stream.Close()
+	_ = peer.stream.Close()
 }
 
 // handleResumeHalf parks one half of a STREAM_RESUME pair in the
@@ -1408,7 +1437,7 @@ func (s *Server) handleMigrateToRelay(st transport.Stream, f *orp.Frame) {
 // will use to drive retransmission from their ring buffers; the relay
 // itself does not need to interpret those numbers — it only needs to
 // connect the two new streams so bytes flow.
-func (s *Server) handleResumeHalf(_ context.Context, st transport.Stream, f *orp.Frame) {
+func (s *Server) handleResumeHalf(_ context.Context, callerURI string, st transport.Stream, f *orp.Frame) {
 	rj := &orpv1.StreamResume{}
 	if err := orp.UnmarshalProto(f, orp.FrameTypeStreamResume, rj); err != nil {
 		s.logger.Warn("edge: STREAM_RESUME unmarshal failed", "err", err)
@@ -1421,6 +1450,7 @@ func (s *Server) handleResumeHalf(_ context.Context, st transport.Stream, f *orp
 	half := &halfStream{
 		id:         resume.StreamID(rj.StreamId),
 		stream:     st,
+		uri:        callerURI,
 		myPos:      int64(rj.MyPosition),      // #nosec G115 -- byte count, fits in int64
 		peerAckPos: int64(rj.PeerAckPosition), // #nosec G115 -- byte count, fits in int64
 	}
@@ -1434,22 +1464,29 @@ func (s *Server) handleResumeHalf(_ context.Context, st transport.Stream, f *orp
 		return
 	}
 	s.logger.Debug("edge: STREAM_RESUME matched",
-		"stream_id", rj.StreamId)
-	// Echo peer's STREAM_RESUME payload onto this half's stream so the
-	// local agent learns peer.peer_ack_position and can drive the
-	// retransmit-from-ring step. The echo is written before splice
-	// begins so it sits ahead of any peer app bytes in the byte order.
-	_ = orp.WriteFrame(st, orp.FrameTypeStreamResume, &orpv1.StreamResume{
-		StreamId:        uint64(half.id),
-		MyPosition:      uint64(matched.myPos),      // #nosec G115 -- byte count, never negative
-		PeerAckPosition: uint64(matched.peerAckPos), // #nosec G115 -- byte count, never negative
-	})
-	n, _ := splice.Bidirectional(st, matched.stream)
-	if s.metrics != nil {
-		s.metrics.bytesForwarded.Add(n)
+		"stream_id", rj.StreamId, "splicer", half.splicer)
+	if !half.splicer {
+		// The peer's goroutine owns both streams from here; stay
+		// parked so the deferred close in handleConsumerStream does
+		// not cut this half short.
+		<-half.done
+		return
 	}
-	_ = st.Close()
-	_ = matched.stream.Close()
+	// Echo each side's STREAM_RESUME payload onto the *other* side's
+	// stream so each agent learns peer.peer_ack_position and can drive
+	// the retransmit-from-ring step. Both echoes are written here, by
+	// the one goroutine that will run the splice, so they sit ahead of
+	// any app bytes in each stream's byte order.
+	echo := func(dst transport.Stream, src *halfStream) {
+		_ = orp.WriteFrame(dst, orp.FrameTypeStreamResume, &orpv1.StreamResume{
+			StreamId:        uint64(half.id),
+			MyPosition:      uint64(src.myPos),      // #nosec G115 -- byte count, never negative
+			PeerAckPosition: uint64(src.peerAckPos), // #nosec G115 -- byte count, never negative
+		})
+	}
+	echo(st, matched)
+	echo(matched.stream, half)
+	s.splicePair(half, matched)
 }
 
 // uriFromConn extracts the URI SAN from the peer leaf cert.

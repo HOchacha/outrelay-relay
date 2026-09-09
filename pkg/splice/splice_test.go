@@ -5,6 +5,7 @@ package splice_test
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"testing"
@@ -155,5 +156,55 @@ func TestBidirectionalReportsByteCount(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("splice did not return within deadline")
+	}
+}
+
+// abortableStream records which shutdown the splice chose for the
+// surviving side of a pair.
+type abortableStream struct {
+	io.Reader
+	io.Writer
+	closeWrite, cancelWrite, cancelRead bool
+	cancelCode                          uint64
+}
+
+func (a *abortableStream) CloseWrite() error    { a.closeWrite = true; return nil }
+func (a *abortableStream) CancelWrite(c uint64) { a.cancelWrite = true; a.cancelCode = c }
+func (a *abortableStream) CancelRead(c uint64)  { a.cancelRead = true; a.cancelCode = c }
+
+type failingReader struct{ err error }
+
+func (f failingReader) Read([]byte) (int, error) { return 0, f.err }
+
+// TestCopyAbortsDestinationWhenSourceFails —
+//
+// When one side of a spliced pair dies mid-stream (relay-side
+// connection loss, drain, crash), the survivor must see a stream
+// *reset*, not a clean FIN: the agent's ResumableStream treats
+// io.EOF as "peer is done" and tears the application connection
+// down, whereas a reset parks it for STREAM_RESUME. Only a genuine
+// EOF from the source may be propagated as a half-close.
+func TestCopyAbortsDestinationWhenSourceFails(t *testing.T) {
+	t.Parallel()
+
+	dead := &abortableStream{Reader: failingReader{err: errors.New("connection lost")}, Writer: io.Discard}
+	survivor := &abortableStream{Reader: failingReader{err: errors.New("connection lost")}, Writer: io.Discard}
+	_, _ = splice.Bidirectional(dead, survivor)
+	if !survivor.cancelWrite || !survivor.cancelRead {
+		t.Fatalf("survivor not aborted: %+v", survivor)
+	}
+	if survivor.closeWrite {
+		t.Fatalf("survivor got a clean half-close on an abnormal end: %+v", survivor)
+	}
+	if survivor.cancelCode != splice.AbortCode {
+		t.Fatalf("abort code %#x, want %#x", survivor.cancelCode, splice.AbortCode)
+	}
+
+	// Clean EOF from the source still half-closes the destination.
+	eofSrc := &abortableStream{Reader: bytes.NewReader([]byte("bye")), Writer: io.Discard}
+	dst := &abortableStream{Reader: failingReader{err: io.EOF}, Writer: io.Discard}
+	_, _ = splice.Bidirectional(eofSrc, dst)
+	if !dst.closeWrite || dst.cancelWrite || dst.cancelRead {
+		t.Fatalf("clean EOF must half-close, not abort: %+v", dst)
 	}
 }

@@ -27,6 +27,15 @@ type halfStream struct {
 	peerAckPos int64
 	arrivedAt  time.Time
 	matched    chan *halfStream
+	// uri identifies the agent that sent this half, so the relay can
+	// record the pair for control-frame forwarding after resume.
+	uri string
+	// splicer is set on exactly one half of a matched pair: the one
+	// whose goroutine runs the splice. The other half's goroutine
+	// just waits on done, which the splicer closes when the splice
+	// ends, so its stream stays open for the whole splice.
+	splicer bool
+	done    chan struct{}
 }
 
 // resumeMatcher pairs STREAM_RESUME halves from two reconnecting
@@ -53,11 +62,16 @@ func (m *resumeMatcher) Submit(self *halfStream) <-chan *halfStream {
 	if peer, ok := m.pending[self.id]; ok {
 		delete(m.pending, self.id)
 		m.mu.Unlock()
+		// The half that completes the pair owns the splice; the
+		// parked one only waits for it to finish.
+		self.splicer = true
+		peer.splicer = false
 		// Notify both halves of each other.
 		peer.matched <- self
 		self.matched <- peer
 		return self.matched
 	}
+	self.done = make(chan struct{})
 	m.pending[self.id] = self
 	m.mu.Unlock()
 

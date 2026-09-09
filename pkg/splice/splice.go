@@ -18,6 +18,10 @@ import (
 // BufferSize is the per-direction copy buffer.
 const BufferSize = 64 * 1024
 
+// AbortCode is the QUIC stream error code the relay uses when it
+// resets the surviving side of a pair after the other side failed.
+const AbortCode = 0x0A
+
 var bufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, BufferSize)
@@ -31,6 +35,14 @@ var bufPool = sync.Pool{
 // without tearing down the other.
 type HalfCloser interface {
 	CloseWrite() error
+}
+
+// Aborter is a stream whose both directions can be reset with an
+// error code (QUIC RESET_STREAM + STOP_SENDING). quic.Stream satisfies
+// it; the TCP+yamux fallback does not and degrades to CloseWrite.
+type Aborter interface {
+	CancelWrite(code uint64)
+	CancelRead(code uint64)
 }
 
 // Bidirectional pipes a <-> b until either side EOFs or errors. It
@@ -84,11 +96,23 @@ func copyOne(dst io.Writer, src io.Reader) (int64, error) {
 	defer bufPool.Put(bufp)
 
 	n, err := io.CopyBuffer(dst, src, *bufp)
-	if hc, ok := dst.(HalfCloser); ok {
-		_ = hc.CloseWrite()
-	}
 	if err == nil || errors.Is(err, io.EOF) {
+		// src is done for real: let dst's peer see a clean FIN.
+		if hc, ok := dst.(HalfCloser); ok {
+			_ = hc.CloseWrite()
+		}
 		return n, nil
+	}
+	// src (or dst) failed under us — relay-side connection loss,
+	// drain, crash. The surviving peer must NOT see a FIN, which its
+	// bridge would take as "application finished" and turn into a
+	// tear-down of the app connection; a reset tells it the transport
+	// broke, so it parks the stream and waits for STREAM_RESUME.
+	if ab, ok := dst.(Aborter); ok {
+		ab.CancelWrite(AbortCode)
+		ab.CancelRead(AbortCode)
+	} else if hc, ok := dst.(HalfCloser); ok {
+		_ = hc.CloseWrite()
 	}
 	return n, err
 }
