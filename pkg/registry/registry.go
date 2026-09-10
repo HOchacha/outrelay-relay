@@ -16,6 +16,9 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
+
+	"google.golang.org/grpc"
 
 	pb "github.com/boanlab/OutRelay/lib/control/v1"
 	"github.com/boanlab/OutRelay/lib/identity"
@@ -117,6 +120,13 @@ func (r *Registry) UnregisterAgent(ctx context.Context, uri string) {
 		"tenant", tenant, "uri", uri)
 }
 
+// registerWait bounds how long RegisterService waits for the controller
+// connection to become ready. A provider that connects while the
+// controller is restarting would otherwise be answered from gRPC's
+// reconnect backoff with a fail-fast Unavailable, and a failed REGISTER
+// is terminal for the agent (no ack, no retry).
+const registerWait = 15 * time.Second
+
 // RegisterService publishes a service registration to the controller.
 // The local agent_uri -> Provider map is unchanged (registered earlier
 // when the connection was accepted).
@@ -125,13 +135,15 @@ func (r *Registry) RegisterService(ctx context.Context, agentURI, serviceName, l
 	if tenant == "" {
 		return "", fmt.Errorf("registry: cannot extract tenant from %q", agentURI)
 	}
+	ctx, cancel := context.WithTimeout(ctx, registerWait)
+	defer cancel()
 	resp, err := r.ctrl.RegisterService(ctx, &pb.RegisterServiceRequest{
 		Tenant:      tenant,
 		ServiceName: serviceName,
 		AgentUri:    agentURI,
 		RelayId:     r.relayID,
 		LocalAddr:   localAddr,
-	})
+	}, grpc.WaitForReady(true))
 	if err != nil {
 		return "", fmt.Errorf("registry: register: %w", err)
 	}

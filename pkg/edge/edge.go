@@ -485,6 +485,27 @@ func (s *Server) writeStreamReject(st transport.Stream, code uint32, reason stri
 	}
 }
 
+// rejectConsumer is writeStreamReject for a consumer-side agent's
+// OPEN_STREAM: besides the stream-scoped frame on the data stream it
+// mirrors the reject on the agent's stream-0 ctrl, tagged with the
+// stream id. The agent is parked on {STREAM_READY | ALLOC_GRANTED}
+// for that id after OPEN_STREAM; without the mirror it has no
+// negative signal, times out into splice mode and bridges the data
+// stream — handing the reject frame bytes to the application as
+// payload. caller may be nil (inter-relay callers have no ctrl).
+func (s *Server) rejectConsumer(caller *AgentConn, st transport.Stream, streamID uint64, code uint32, reason string) {
+	s.writeStreamReject(st, code, reason)
+	if caller == nil || streamID == 0 {
+		return
+	}
+	if err := caller.WriteCtrl(orp.FrameTypeStreamReject, &orpv1.StreamReject{
+		Code: code, Reason: reason, StreamId: streamID,
+	}); err != nil {
+		s.logger.Debug("edge: STREAM_REJECT ctrl mirror failed",
+			"stream_id", streamID, "caller", caller.uri, "err", err)
+	}
+}
+
 func (s *Server) controlLoop(ctx context.Context, ac *AgentConn, ctrl transport.Stream) {
 	for {
 		f, err := orp.ParseFrame(ctrl)
@@ -527,7 +548,12 @@ func (s *Server) handleRegister(ctx context.Context, ac *AgentConn, ctrl transpo
 	}
 	id, err := s.reg.RegisterService(ctx, ac.uri, reg.ServiceName, reg.LocalAddr)
 	if err != nil {
-		s.logger.Warn("register rejected", "name", reg.ServiceName, "err", err)
+		// The agent is blocked on REGISTER_ACK and ORP has no negative
+		// reply for REGISTER; leaving it hanging makes a provider that
+		// is "connected" but unreachable for life. Close the link so
+		// Expose fails and the agent's reconnect path retries.
+		s.logger.Warn("register rejected; closing link", "name", reg.ServiceName, "agent", ac.uri, "err", err)
+		_ = ac.conn.Close()
 		return
 	}
 	s.logger.Info("registered", "name", reg.ServiceName, "agent", ac.uri)
@@ -594,7 +620,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		dec := s.evaluate(caller.uri, open.TargetService, open.Method)
 		s.recordAudit(caller.uri, open.TargetService, open.Method, dec)
 		if dec.Decision == policy.DecisionDeny {
-			s.writeStreamReject(consumerStream, 403, "denied: "+dec.Reason)
+			s.rejectConsumer(caller, consumerStream, open.StreamId, 403, "denied: "+dec.Reason)
 			return
 		}
 		p2pMode = dec.P2PMode
@@ -608,14 +634,14 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	prov, remote, err := s.reg.Resolve(ctx, caller.uri, open.TargetService)
 	if errors.Is(err, registry.ErrProviderRemote) {
 		if s.pool == nil || remote == nil || remote.Endpoint == "" {
-			s.writeStreamReject(consumerStream, 502, "inter-relay forwarding unavailable")
+			s.rejectConsumer(caller, consumerStream, open.StreamId, 502, "inter-relay forwarding unavailable")
 			return
 		}
-		s.forwardToPeer(ctx, caller.uri, open, consumerStream, remote)
+		s.forwardToPeer(ctx, caller, open, consumerStream, remote)
 		return
 	}
 	if err != nil {
-		s.writeStreamReject(consumerStream, 404, "service not found")
+		s.rejectConsumer(caller, consumerStream, open.StreamId, 404, "service not found")
 		return
 	}
 	// Callee-side policy check — now that we know the resolved
@@ -630,7 +656,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 			"decision", callee.Decision.String(), "relay_mode", callee.RelayMode.String(),
 			"p2p_mode", callee.P2PMode.String(), "reason", callee.Reason)
 		if callee.Decision == policy.DecisionDeny {
-			s.writeStreamReject(consumerStream, 403, "denied (callee): "+callee.Reason)
+			s.rejectConsumer(caller, consumerStream, open.StreamId, 403, "denied (callee): "+callee.Reason)
 			return
 		}
 		p2pMode = policy.CombineP2PModes(p2pMode, callee.P2PMode)
@@ -665,7 +691,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		s.logger.Warn("edge: OpenIncoming failed",
 			"stream_id", open.StreamId, "consumer", caller.uri,
 			"provider", prov.AgentURI(), "service", open.TargetService, "err", err)
-		s.writeStreamReject(consumerStream, 502, "provider stream open failed")
+		s.rejectConsumer(caller, consumerStream, open.StreamId, 502, "provider stream open failed")
 		return
 	}
 	s.logger.Debug("edge: OpenIncoming ok",
@@ -680,7 +706,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	if !s.recordPair(open.StreamId, pair) {
 		s.logger.Warn("stream id collision rejected",
 			"stream_id", open.StreamId, "consumer", caller.uri, "provider", prov.AgentURI())
-		s.writeStreamReject(consumerStream, 409, "stream id collision")
+		s.rejectConsumer(caller, consumerStream, open.StreamId, 409, "stream id collision")
 		return
 	}
 	s.logger.Debug("edge: stream pair recorded",
@@ -715,7 +741,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 	case orp.FrameTypeStreamReject:
 		s.logger.Info("edge: provider rejected stream",
 			"caller", caller.uri, "provider", prov.AgentURI(), "stream_id", open.StreamId)
-		s.writeStreamReject(consumerStream, 503, "provider rejected")
+		s.rejectConsumer(caller, consumerStream, open.StreamId, 503, "provider rejected")
 		return
 	default:
 		s.logger.Warn("edge: unexpected provider ack frame",
@@ -734,7 +760,7 @@ func (s *Server) handleConsumerStream(ctx context.Context, caller *AgentConn, co
 		if provAC == nil {
 			s.logger.Warn("edge: forward — provider control channel unavailable",
 				"caller", caller.uri, "provider", prov.AgentURI(), "stream_id", open.StreamId)
-			s.writeStreamReject(consumerStream, 502, "forward: provider control channel unavailable")
+			s.rejectConsumer(caller, consumerStream, open.StreamId, 502, "forward: provider control channel unavailable")
 			return
 		}
 		consumerAlloc := s.forward.Allocate(caller.uri)
@@ -984,22 +1010,22 @@ func (s *Server) handleForwardedStream(ctx context.Context, peerStream transport
 // connection, splices it with the consumer stream, and on dial /
 // open errors drops the cached peer conn so the next attempt
 // redials.
-func (s *Server) forwardToPeer(ctx context.Context, callerURI string, open *orpv1.OpenStream, consumerStream transport.Stream, remote *registry.Remote) {
+func (s *Server) forwardToPeer(ctx context.Context, caller *AgentConn, open *orpv1.OpenStream, consumerStream transport.Stream, remote *registry.Remote) {
 	if s.metrics != nil {
 		s.metrics.intraRelayHops.Inc()
 	}
 	peer, err := s.pool.Get(ctx, remote.RelayID, remote.Endpoint)
 	if err != nil {
 		s.logger.Warn("dial peer relay", "id", remote.RelayID, "err", err)
-		s.writeStreamReject(consumerStream, 502, "peer relay unreachable")
+		s.rejectConsumer(caller, consumerStream, open.StreamId, 502, "peer relay unreachable")
 		return
 	}
-	peerStream, err := intra.ForwardStream(ctx, peer, open.TargetService, open.Method, callerURI)
+	peerStream, err := intra.ForwardStream(ctx, peer, open.TargetService, open.Method, caller.uri)
 	if err != nil {
 		s.logger.Warn("forward to peer", "id", remote.RelayID, "err", err)
 		// Cached conn may be dead; drop so the next attempt redials.
 		s.pool.Drop(remote.RelayID)
-		s.writeStreamReject(consumerStream, 502, "peer relay forward failed")
+		s.rejectConsumer(caller, consumerStream, open.StreamId, 502, "peer relay forward failed")
 		return
 	}
 	defer peerStream.Close()

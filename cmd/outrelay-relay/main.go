@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
@@ -102,8 +103,21 @@ func main() {
 		logger.Warn("relay: controller gRPC plaintext — pair with controller-side -cert/-key/-ca and set -controller-tls for production",
 			"addr", *controllerAddr)
 	}
+	// Cap reconnect backoff: gRPC's default grows to 120 s, during
+	// which every fail-fast RPC (policy watch reopen, heartbeat,
+	// resolve) is answered from the backoff state without a dial.
+	// A controller restart should cost seconds, not minutes.
 	cc, err := grpc.NewClient(*controllerAddr,
 		grpc.WithTransportCredentials(ctrlCreds),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  500 * time.Millisecond,
+				Multiplier: 1.6,
+				Jitter:     0.2,
+				MaxDelay:   5 * time.Second,
+			},
+			MinConnectTimeout: 5 * time.Second,
+		}),
 	)
 	if err != nil {
 		logger.Error("dial controller", "addr", *controllerAddr, "err", err)
