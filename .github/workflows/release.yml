@@ -4,9 +4,19 @@ on:
   push:
     tags: ['v*']
 
+defaults:
+  run:
+    # Every job checks this module out into a subdirectory so its
+    # sibling modules can sit next to it (see checkout-siblings.sh).
+    working-directory: outrelay-relay
+
 env:
   # Bypass proxy.golang.org for boanlab/* modules; see ci.yml.
   GOPRIVATE: github.com/boanlab/*
+  # Which checkout of the sibling modules to build against; a fork's
+  # pull request is built against that fork's siblings.
+  SIBLING_OWNER: ${{ github.event.pull_request.head.repo.owner.login || github.repository_owner }}
+  SIBLING_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
 
 jobs:
   go-fmt:
@@ -14,7 +24,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: outrelay-relay
           persist-credentials: false
+      - name: Check out sibling modules
+        run: .github/scripts/checkout-siblings.sh OutRelay
       - uses: actions/setup-go@v5
         with:
           go-version: "stable"
@@ -26,7 +39,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: outrelay-relay
           persist-credentials: false
+      - name: Check out sibling modules
+        run: .github/scripts/checkout-siblings.sh OutRelay
       - uses: actions/setup-go@v5
         with:
           go-version: "stable"
@@ -38,7 +54,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: outrelay-relay
           persist-credentials: false
+      - name: Check out sibling modules
+        run: .github/scripts/checkout-siblings.sh OutRelay
       - uses: actions/setup-go@v5
         with:
           go-version: "stable"
@@ -50,7 +69,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: outrelay-relay
           persist-credentials: false
+      - name: Check out sibling modules
+        run: .github/scripts/checkout-siblings.sh OutRelay
       - uses: actions/setup-go@v5
         with:
           go-version: "stable"
@@ -63,7 +85,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          path: outrelay-relay
           persist-credentials: false
+      - name: Check out sibling modules
+        run: .github/scripts/checkout-siblings.sh OutRelay
       - uses: docker/setup-buildx-action@v3
       - name: Login to DockerHub
         uses: docker/login-action@v3
