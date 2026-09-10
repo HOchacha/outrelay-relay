@@ -9,6 +9,7 @@ package edge
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"testing"
@@ -221,25 +222,43 @@ func TestHandleForwardResumePairsAndGrantsBoth(t *testing.T) {
 	srv.handleForwardResume(bAC, frame(streamID, 16768, 16768))
 
 	// Each side should observe an AllocGranted with the same stream id.
-	readGranted := func(t *testing.T, r net.Conn) *orpv1.AllocGranted {
-		t.Helper()
-		_ = r.SetReadDeadline(time.Now().Add(2 * time.Second))
-		f, ferr := orp.ParseFrame(r)
-		if ferr != nil {
-			t.Fatalf("ParseFrame: %v", ferr)
-		}
-		if f.Type != orp.FrameTypeAllocGranted {
-			t.Fatalf("frame type: got %v want AllocGranted", f.Type)
-		}
-		g := &orpv1.AllocGranted{}
-		if uerr := orp.UnmarshalProto(f, orp.FrameTypeAllocGranted, g); uerr != nil {
-			t.Fatalf("unmarshal: %v", uerr)
-		}
-		return g
+	// The driving half writes to itself before its peer, and which of
+	// the two submissions ends up driving is a race — so both pipes
+	// (net.Pipe is an unbuffered rendezvous) have to be read
+	// concurrently, or one write blocks waiting for a reader that is
+	// itself blocked on the other pipe.
+	readGranted := func(r net.Conn) <-chan any {
+		out := make(chan any, 1)
+		go func() {
+			_ = r.SetReadDeadline(time.Now().Add(5 * time.Second))
+			f, ferr := orp.ParseFrame(r)
+			if ferr != nil {
+				out <- fmt.Errorf("ParseFrame: %w", ferr)
+				return
+			}
+			if f.Type != orp.FrameTypeAllocGranted {
+				out <- fmt.Errorf("frame type: got %v want AllocGranted", f.Type)
+				return
+			}
+			g := &orpv1.AllocGranted{}
+			if uerr := orp.UnmarshalProto(f, orp.FrameTypeAllocGranted, g); uerr != nil {
+				out <- fmt.Errorf("unmarshal: %w", uerr)
+				return
+			}
+			out <- g
+		}()
+		return out
 	}
-
-	aGranted := readGranted(t, aRead)
-	bGranted := readGranted(t, bRead)
+	aCh, bCh := readGranted(aRead), readGranted(bRead)
+	mustGrant := func(v any) *orpv1.AllocGranted {
+		t.Helper()
+		if err, bad := v.(error); bad {
+			t.Fatal(err)
+		}
+		return v.(*orpv1.AllocGranted)
+	}
+	aGranted := mustGrant(<-aCh)
+	bGranted := mustGrant(<-bCh)
 
 	if aGranted.StreamId != streamID || bGranted.StreamId != streamID {
 		t.Fatalf("stream_id mismatch: a=%d b=%d want=%d",
